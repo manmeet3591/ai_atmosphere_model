@@ -1,0 +1,5 @@
+{
+  "variable": "toa_insolation",
+  "min": -0.25,
+  "max": 2014404.625
+}
