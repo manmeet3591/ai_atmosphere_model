@@ -125,11 +125,12 @@ def train(args):
             date_t.isoformat(), date_t1.isoformat(),
         )
 
-    # Prefetch workers: cap at 2 to avoid holding multiple full ERA5 days in RAM
-    # simultaneously. ERA5 daily compute is ~2 GB/day; 2 workers = ~4 GB overhead.
+    # prefetch_workers controls RAM (2 concurrent ERA5 fetches = ~4 GB overhead).
+    # B controls GPU batch size. We accumulate B samples using a sliding window
+    # of prefetch_workers futures — separating RAM safety from batch size.
     prefetch_workers = min(B, args.prefetch_workers)
     with concurrent.futures.ThreadPoolExecutor(max_workers=prefetch_workers) as pool:
-        # Pre-fill with up to prefetch_workers parallel ERA5 fetches
+        # Sliding-window prefetch: always keep prefetch_workers futures in flight
         future_queue = deque()
         prefill = min(prefetch_workers, len(dates_todo))
         for i in range(prefill):
@@ -137,50 +138,50 @@ def train(args):
             log.info(f"  Prefetch started for {dates_todo[i].isoformat()}")
         next_idx = prefill
 
+        batch_X, batch_Y, dates_in_batch = [], [], []
+
         while future_queue:
-            # ---- Drain the queue to collect up to B samples ----
-            pending = list(future_queue)
-            future_queue.clear()
+            # ---- Pull one sample at a time, replenish the sliding window ----
+            date_t, future = future_queue.popleft()
 
-            batch_X, batch_Y, dates_in_batch = [], [], []
+            # Immediately submit the next future to keep the pool busy
+            if next_idx < len(dates_todo):
+                nxt = dates_todo[next_idx]
+                future_queue.append((nxt, _submit(pool, nxt)))
+                log.info(f"  Prefetch started for {nxt.isoformat()}")
+                next_idx += 1
 
-            for date_t, future in pending:
-                # Immediately replenish the pool slot
-                if next_idx < len(dates_todo):
-                    nxt = dates_todo[next_idx]
-                    future_queue.append((nxt, _submit(pool, nxt)))
-                    log.info(f"  Prefetch started for {nxt.isoformat()}")
-                    next_idx += 1
+            date_t1     = date_t + datetime.timedelta(days=1)
+            date_t_str  = date_t.isoformat()
+            date_t1_str = date_t1.isoformat()
 
-                date_t1     = date_t + datetime.timedelta(days=1)
-                date_t_str  = date_t.isoformat()
-                date_t1_str = date_t1.isoformat()
+            t_wait = time.perf_counter()
+            try:
+                ds_atm_t, ds_atm_t1, ds_lnd_t = future.result()
+            except Exception as exc:
+                log.warning(f"  SKIP {date_t_str}: ERA5 failed: {exc}")
+                continue
+            wait_s = time.perf_counter() - t_wait
+            log.info(f"  [{date_t_str}] ERA5 ready  wait={wait_s:.1f}s")
 
-                # Wait for ERA5 (should be instant — was fetched in parallel)
-                t_wait = time.perf_counter()
-                try:
-                    ds_atm_t, ds_atm_t1, ds_lnd_t = future.result()
-                except Exception as exc:
-                    log.warning(f"  SKIP {date_t_str}: ERA5 failed: {exc}")
-                    continue
-                wait_s = time.perf_counter() - t_wait
-                log.info(f"  [{date_t_str}] ERA5 ready  wait={wait_s:.1f}s")
+            try:
+                xb, yb = build_sample(
+                    date_t_str, date_t1_str,
+                    ds_atm_t, ds_atm_t1, ds_lnd_t,
+                    godas_index, ds_stat, ref_lat, ref_lon, regridder,
+                )
+            except Exception as exc:
+                log.warning(f"  SKIP {date_t_str}: sample build failed: {exc}")
+                continue
 
-                # Build sample (GODAS + channels + HEALPix)
-                try:
-                    xb, yb = build_sample(
-                        date_t_str, date_t1_str,
-                        ds_atm_t, ds_atm_t1, ds_lnd_t,
-                        godas_index, ds_stat, ref_lat, ref_lon, regridder,
-                    )
-                except Exception as exc:
-                    log.warning(f"  SKIP {date_t_str}: sample build failed: {exc}")
-                    continue
+            del ds_atm_t, ds_atm_t1, ds_lnd_t
+            batch_X.append(xb)
+            batch_Y.append(yb)
+            dates_in_batch.append(date_t_str)
 
-                del ds_atm_t, ds_atm_t1, ds_lnd_t
-                batch_X.append(xb)   # [1, 20, 12, 64, 64]
-                batch_Y.append(yb)   # [1, 14, 12, 64, 64]
-                dates_in_batch.append(date_t_str)
+            # ---- Train when we have B samples or the queue is exhausted ----
+            if len(batch_X) < B and future_queue:
+                continue  # keep accumulating
 
             if not batch_X:
                 continue
@@ -248,6 +249,9 @@ def train(args):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             gc.collect()
+
+            # Reset accumulators for next batch
+            batch_X, batch_Y, dates_in_batch = [], [], []
 
     log.info(f"Training complete. Best loss: {best_loss:.6f}")
     log.info(f"Model saved to: {args.checkpoint}")
