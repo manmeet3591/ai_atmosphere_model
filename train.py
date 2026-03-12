@@ -22,6 +22,7 @@ import datetime
 import argparse
 import logging
 import time
+import concurrent.futures
 
 import numpy as np
 import xarray as xr
@@ -399,38 +400,55 @@ def to_healpix(regridder, channel_stack):
 
 
 # ---------------------------------------------------------------------------
-# Build one training sample
+# ERA5 fetcher (runs in background thread for prefetching)
 # ---------------------------------------------------------------------------
 
-def build_sample(date_t_str, date_t1_str,
-                 ds_atmos, ds_land, godas_index, ds_stat,
-                 ref_lat, ref_lon, regridder):
+def fetch_era5_for_day(ds_atmos, ds_land, date_t_str, date_t1_str):
     """
-    Returns:
-        xb: [1, 20, 12, nside, nside]
-        yb: [1, 14, 12, nside, nside]
+    Fetch and .compute() ERA5 data for one (t, t+1) pair into RAM.
+    Designed to run in a background thread while the GPU trains.
+    Returns (ds_atm_t, ds_atm_t1, ds_lnd_t) as in-memory xr.Datasets.
     """
     date_t2_str = (datetime.date.fromisoformat(date_t1_str)
                    + datetime.timedelta(days=1)).isoformat()
 
-    tag = f"input={date_t_str} -> target={date_t1_str}"
-    t0 = time.perf_counter()
-
-    log.info(f"  [{tag}] Fetching ERA5 atmosphere daily mean ...")
     atm_win    = ensure_lat_ascending(
                      ds_atmos.sel(time=slice(date_t_str, date_t2_str)))
     ds_atm_day = daily_mean(atm_win)
     ds_atm_t   = pick_single_day(ds_atm_day, date_t_str)
     ds_atm_t1  = pick_single_day(ds_atm_day, date_t1_str)
-    log.info(f"  [{tag}] ERA5 atmos done  ({time.perf_counter()-t0:.1f}s)")
 
-    t1 = time.perf_counter()
-    log.info(f"  [{tag}] Fetching ERA5 land daily mean ...")
     lnd_win    = ensure_lat_ascending(
                      ds_land.sel(time=slice(date_t_str, date_t1_str)))
     ds_lnd_day = daily_mean(lnd_win)
     ds_lnd_t   = pick_single_day(ds_lnd_day, date_t_str)
-    log.info(f"  [{tag}] ERA5 land done  ({time.perf_counter()-t1:.1f}s)")
+
+    # Single GCS batch compute — this is the ~150 s network call
+    ds_atm_t  = ds_atm_t.compute()
+    ds_atm_t1 = ds_atm_t1.compute()
+    ds_lnd_t  = ds_lnd_t.compute()
+
+    return ds_atm_t, ds_atm_t1, ds_lnd_t
+
+
+# ---------------------------------------------------------------------------
+# Build one training sample (ERA5 already in RAM — only GODAS + channels)
+# ---------------------------------------------------------------------------
+
+def build_sample(date_t_str, date_t1_str,
+                 ds_atm_t, ds_atm_t1, ds_lnd_t,
+                 godas_index, ds_stat,
+                 ref_lat, ref_lon, regridder):
+    """
+    ds_atm_t / ds_atm_t1 / ds_lnd_t must be pre-fetched in-memory datasets
+    (from fetch_era5_for_day).
+
+    Returns:
+        xb: [1, 20, 12, nside, nside]
+        yb: [1, 14, 12, nside, nside]
+    """
+    tag = f"input={date_t_str} -> target={date_t1_str}"
+    t0 = time.perf_counter()
 
     t2 = time.perf_counter()
     log.info(f"  [{tag}] Loading GODAS ocean snapshot ...")
@@ -443,10 +461,12 @@ def build_sample(date_t_str, date_t1_str,
         latitude=ref_lat, longitude=ref_lon, method="linear")
     log.info(f"  [{tag}] Ocean regrid done  ({time.perf_counter()-t3:.1f}s)")
 
+    # align() is only needed for non-ERA5 fields (ocean, static).
+    # ERA5 is already on the 0.25-deg grid — skip interp for it.
     def align(da2d):
         return da2d.interp(latitude=ref_lat, longitude=ref_lon, method="linear")
 
-    t4 = time.perf_counter()
+    t4b = time.perf_counter()
     log.info(f"  [{tag}] Building channel tensors (NaN fill + normalize) ...")
     GEOPO = resolve_var(ds_atm_t, ["geopotential", "z"])
     TEMP  = resolve_var(ds_atm_t, ["temperature", "t"])
@@ -484,11 +504,18 @@ def build_sample(date_t_str, date_t1_str,
         ("salinity",              "salinity"),
     ]
 
-    def process_2d(da, norm_key, convert_gph=False):
+    def process_2d(da, norm_key, convert_gph=False, needs_align=False):
         da = to_2d(da)
         if convert_gph:
             da = da / G0
-        da = fill_latlon_nans_2d(align(da))
+        if needs_align:
+            # Non-ERA5 fields (ocean, static) need regridding + NaN fill
+            da = fill_latlon_nans_2d(align(da))
+        else:
+            # ERA5 is already on the 0.25-deg grid — just fill any residual NaNs
+            vals = da.values
+            if np.isnan(vals).any():
+                da = fill_latlon_nans_2d(da)
         return torch.tensor(norm_minmax(da.values, norm_key), dtype=torch.float32)
 
     # X(t): 20 channels
@@ -508,10 +535,10 @@ def build_sample(date_t_str, date_t1_str,
         da = ds_ocn_t_rg[v]
         if "level" in da.dims:
             da = da.isel(level=0)
-        X_ch.append(process_2d(da, nk))
+        X_ch.append(process_2d(da, nk, needs_align=True))
 
     for sv, nk in [("mask", "landseamask"), ("topo", "elevation")]:
-        X_ch.append(process_2d(ds_stat[sv], nk))
+        X_ch.append(process_2d(ds_stat[sv], nk, needs_align=True))
 
     X_ll = torch.stack(X_ch, dim=0)   # [20, lat, lon]
 
@@ -527,7 +554,7 @@ def build_sample(date_t_str, date_t1_str,
 
     Y_ll = torch.stack(Y_ch, dim=0)   # [14, lat, lon]
 
-    log.info(f"  [{tag}] Channel tensors done  ({time.perf_counter()-t4:.1f}s)")
+    log.info(f"  [{tag}] Channel tensors done  ({time.perf_counter()-t4b:.1f}s)")
 
     t5 = time.perf_counter()
     log.info(f"  [{tag}] Projecting to HEALPix ...")
@@ -613,65 +640,110 @@ def train(args):
     model.train()
     step = 0
 
+    def _submit_era5(pool, date_t, date_t1):
+        """Submit a background ERA5 fetch for (date_t, date_t+1)."""
+        return pool.submit(
+            fetch_era5_for_day,
+            ds_atmos, ds_land,
+            date_t.isoformat(), date_t1.isoformat(),
+        )
+
     date_t = start
-    while date_t < end:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        # Kick off the first day's ERA5 fetch immediately (background thread)
         date_t1     = date_t + datetime.timedelta(days=1)
-        date_t_str  = date_t.isoformat()
-        date_t1_str = date_t1.isoformat()
+        era5_future = _submit_era5(pool, date_t, date_t1)
+        log.info(f"  Prefetch started for {date_t.isoformat()}")
 
-        try:
-            xb, yb = build_sample(
-                date_t_str, date_t1_str,
-                ds_atmos, ds_land, godas_index, ds_stat,
-                ref_lat, ref_lon, regridder,
-            )
-        except Exception as exc:
-            log.warning(f"  SKIP {date_t_str}: {exc}")
+        while date_t < end:
+            date_t1     = date_t + datetime.timedelta(days=1)
+            date_t_str  = date_t.isoformat()
+            date_t1_str = date_t1.isoformat()
+
+            # ---- Block until ERA5 for today is ready ----
+            t_wait = time.perf_counter()
+            try:
+                ds_atm_t, ds_atm_t1, ds_lnd_t = era5_future.result()
+            except Exception as exc:
+                log.warning(f"  SKIP {date_t_str}: ERA5 fetch failed: {exc}")
+                date_t = date_t1
+                if date_t < end:
+                    era5_future = _submit_era5(
+                        pool, date_t, date_t + datetime.timedelta(days=1))
+                    log.info(f"  Prefetch started for {date_t.isoformat()}")
+                continue
+            wait_s = time.perf_counter() - t_wait
+            if wait_s < 2.0:
+                log.info(f"  [{date_t_str}] ERA5 ready instantly (prefetched)  "
+                         f"wait={wait_s:.1f}s")
+            else:
+                log.info(f"  [{date_t_str}] ERA5 waited {wait_s:.1f}s  "
+                         f"(GPU was faster than GCS fetch)")
+
+            # ---- Submit next day's ERA5 fetch in background ----
+            date_next  = date_t1
+            date_next1 = date_next + datetime.timedelta(days=1)
+            if date_next < end:
+                era5_future = _submit_era5(pool, date_next, date_next1)
+                log.info(f"  Prefetch started for {date_next.isoformat()}")
+
+            # ---- Build sample (GODAS + channels + HEALPix) ----
+            try:
+                xb, yb = build_sample(
+                    date_t_str, date_t1_str,
+                    ds_atm_t, ds_atm_t1, ds_lnd_t,
+                    godas_index, ds_stat,
+                    ref_lat, ref_lon, regridder,
+                )
+            except Exception as exc:
+                log.warning(f"  SKIP {date_t_str}: {exc}")
+                date_t = date_t1
+                continue
+
+            del ds_atm_t, ds_atm_t1, ds_lnd_t  # free RAM once tensors are built
+
+            x = xb.to(device)
+            y = yb.to(device)
+
+            day_losses = []
+            for epoch in range(1, args.epochs_per_day + 1):
+                noise      = torch.randn_like(y)
+                timesteps  = torch.randint(
+                    0, scheduler.config.num_train_timesteps, (1,), device=device).long()
+                noisy_y    = scheduler.add_noise(y, noise, timesteps)
+                net_input  = torch.cat([noisy_y, x], dim=1)
+
+                noise_pred = model(
+                    sample=net_input,
+                    timestep=timesteps,
+                    encoder_hidden_states=encoder_hidden,
+                ).sample
+
+                loss = loss_fn(noise_pred, noise)
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+
+                loss_val = loss.item()
+                day_losses.append(loss_val)
+                step += 1
+                log.info(f"  {date_t_str}  epoch {epoch:02d}/{args.epochs_per_day}"
+                         f"  loss={loss_val:.6f}  step={step}")
+
+                del noise, noisy_y, net_input, noise_pred, loss
+
+            mean_loss = np.mean(day_losses)
+            if mean_loss < best_loss:
+                best_loss = mean_loss
+                torch.save(model.state_dict(), args.checkpoint)
+                log.info(f"  Checkpoint saved  (best_loss={best_loss:.6f})")
+
+            del x, y, xb, yb
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+
             date_t = date_t1
-            continue
-
-        x = xb.to(device)
-        y = yb.to(device)
-
-        day_losses = []
-        for epoch in range(1, args.epochs_per_day + 1):
-            noise      = torch.randn_like(y)
-            timesteps  = torch.randint(
-                0, scheduler.config.num_train_timesteps, (1,), device=device).long()
-            noisy_y    = scheduler.add_noise(y, noise, timesteps)
-            net_input  = torch.cat([noisy_y, x], dim=1)
-
-            noise_pred = model(
-                sample=net_input,
-                timestep=timesteps,
-                encoder_hidden_states=encoder_hidden,
-            ).sample
-
-            loss = loss_fn(noise_pred, noise)
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-
-            loss_val = loss.item()
-            day_losses.append(loss_val)
-            step += 1
-            log.info(f"  {date_t_str}  epoch {epoch:02d}/{args.epochs_per_day}"
-                     f"  loss={loss_val:.6f}  step={step}")
-
-            del noise, noisy_y, net_input, noise_pred, loss
-
-        mean_loss = np.mean(day_losses)
-        if mean_loss < best_loss:
-            best_loss = mean_loss
-            torch.save(model.state_dict(), args.checkpoint)
-            log.info(f"  Checkpoint saved  (best_loss={best_loss:.6f})")
-
-        del x, y, xb, yb
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
-
-        date_t = date_t1
 
     log.info(f"Training complete. Best loss: {best_loss:.6f}")
     log.info(f"Model saved to: {args.checkpoint}")
