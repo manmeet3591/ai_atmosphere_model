@@ -636,21 +636,50 @@ def build_sample(date_t_str, date_t1_str,
 
 COND_CHANNELS   = 20
 TARGET_CHANNELS = 14
-CROSS_ATTN_DIM  = 1
+CROSS_ATTN_DIM  = 1   # cross-attention context dim (encoder_hidden_states)
 
 
 def build_model(device):
+    """
+    Scaled-up 3D UNet for 98 GB GPU.
+
+    Architecture:
+      Level 0  (64×64): DownBlock3D / UpBlock3D  — pure conv, large spatial
+      Level 1  (32×32): CrossAttnDownBlock3D      — self-attn: 1024 tokens/face
+      Level 2  (16×16): CrossAttnDownBlock3D      — self-attn:  256 tokens/face
+      Level 3  ( 8×8 ): CrossAttnDownBlock3D      — self-attn:   64 tokens/face
+
+    Self-attention at levels 1-3 provides global receptive field needed for
+    S2S teleconnections (ENSO → global). Cross-attention conditions on
+    encoder_hidden_states (currently zero-padded; extend later for e.g. ENSO index).
+
+    block_out_channels=(256,512,1024,1024): ~16× capacity vs. prior (64,128,256,512).
+    attention_head_dim=64: 4/8/16 heads at each level (richer per-head repr.).
+    norm_num_groups=32: standard for models of this scale.
+
+    NOTE: incompatible with old (64,128,256,512) checkpoints — start fresh.
+    """
     model = UNet3DConditionModel(
         sample_size=None,
         in_channels=TARGET_CHANNELS + COND_CHANNELS,
         out_channels=TARGET_CHANNELS,
         layers_per_block=2,
-        block_out_channels=(64, 128, 256, 512),
-        down_block_types=("DownBlock3D", "DownBlock3D", "DownBlock3D", "DownBlock3D"),
-        up_block_types=("UpBlock3D",   "UpBlock3D",   "UpBlock3D",   "UpBlock3D"),
-        norm_num_groups=8,
+        block_out_channels=(256, 512, 1024, 1024),
+        down_block_types=(
+            "DownBlock3D",           # level 0: 64×64, pure conv
+            "CrossAttnDownBlock3D",  # level 1: 32×32, 1024 tokens/face
+            "CrossAttnDownBlock3D",  # level 2: 16×16,  256 tokens/face
+            "CrossAttnDownBlock3D",  # level 3:  8×8,    64 tokens/face
+        ),
+        up_block_types=(
+            "CrossAttnUpBlock3D",    # level 3 mirror
+            "CrossAttnUpBlock3D",    # level 2 mirror
+            "CrossAttnUpBlock3D",    # level 1 mirror
+            "UpBlock3D",             # level 0 mirror
+        ),
+        norm_num_groups=32,
         cross_attention_dim=CROSS_ATTN_DIM,
-        attention_head_dim=8,
+        attention_head_dim=64,
     ).to(device)
     log.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     return model
@@ -691,7 +720,11 @@ def train(args):
     # -- Load best weights if checkpoint exists --
     if args.checkpoint and os.path.exists(args.checkpoint):
         log.info(f"Loading weights from checkpoint: {args.checkpoint}")
-        model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+        try:
+            model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+        except RuntimeError as e:
+            log.warning(f"  Checkpoint incompatible with current architecture "
+                        f"(likely old model size) — starting from scratch. Error: {e}")
 
     encoder_hidden = torch.zeros(1, 1, CROSS_ATTN_DIM, device=device)
 
