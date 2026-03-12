@@ -18,6 +18,7 @@ Usage:
 import os
 import gc
 import glob
+import json
 import datetime
 import argparse
 import logging
@@ -272,6 +273,37 @@ def load_godas_for_date(godas_index, target_date_str):
     ds = standardize_latlon(ds)
     ds = ensure_lat_ascending(ds)
     return ds
+
+
+# ---------------------------------------------------------------------------
+# Progress tracking (resume support)
+# ---------------------------------------------------------------------------
+
+def load_progress(progress_path):
+    """
+    Load completed dates and best loss from a JSON progress file.
+    Returns (completed_dates: set[str], best_loss: float).
+    """
+    if os.path.exists(progress_path):
+        with open(progress_path) as f:
+            data = json.load(f)
+        completed = set(data.get("completed_dates", []))
+        best_loss = data.get("best_loss", float("inf"))
+        log.info(f"Progress file loaded: {len(completed)} dates done, "
+                 f"best_loss={best_loss:.6f}")
+        return completed, best_loss
+    return set(), float("inf")
+
+
+def save_progress(progress_path, completed_dates, best_loss):
+    """Atomically write progress so a crash mid-write doesn't corrupt it."""
+    tmp = progress_path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({
+            "completed_dates": sorted(completed_dates),
+            "best_loss": best_loss,
+        }, f, indent=2)
+    os.replace(tmp, progress_path)
 
 
 # ---------------------------------------------------------------------------
@@ -622,23 +654,37 @@ def train(args):
     loss_fn   = nn.MSELoss()
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
 
-    # Load checkpoint if resuming
-    best_loss = float("inf")
+    # -- Load progress (completed dates + best loss) --
+    completed_dates, best_loss = load_progress(args.progress_file)
+
+    # -- Load best weights if checkpoint exists --
     if args.checkpoint and os.path.exists(args.checkpoint):
-        log.info(f"Resuming from checkpoint: {args.checkpoint}")
+        log.info(f"Loading weights from checkpoint: {args.checkpoint}")
         model.load_state_dict(torch.load(args.checkpoint, map_location=device))
 
     encoder_hidden = torch.zeros(1, 1, CROSS_ATTN_DIM, device=device)
 
-    # -- Date range --
+    # -- Build ordered list of dates still to process --
     start = datetime.date.fromisoformat(args.start_date)
     end   = datetime.date.fromisoformat(args.end_date)
-    total_days = (end - start).days
-    log.info(f"Training: {start} -> {end}  ({total_days} days, "
+    all_dates = []
+    d = start
+    while d < end:
+        all_dates.append(d)
+        d += datetime.timedelta(days=1)
+
+    dates_todo = [d for d in all_dates if d.isoformat() not in completed_dates]
+    skipped = len(all_dates) - len(dates_todo)
+    log.info(f"Training: {start} -> {end}  ({len(all_dates)} days total, "
+             f"{skipped} already done, {len(dates_todo)} remaining, "
              f"{args.epochs_per_day} epochs/day)")
 
+    if not dates_todo:
+        log.info("All dates already completed. Nothing to do.")
+        return
+
     model.train()
-    step = 0
+    step = len(completed_dates) * args.epochs_per_day  # keep step count consistent
 
     def _submit_era5(pool, date_t, date_t1):
         """Submit a background ERA5 fetch for (date_t, date_t+1)."""
@@ -648,14 +694,13 @@ def train(args):
             date_t.isoformat(), date_t1.isoformat(),
         )
 
-    date_t = start
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        # Kick off the first day's ERA5 fetch immediately (background thread)
-        date_t1     = date_t + datetime.timedelta(days=1)
-        era5_future = _submit_era5(pool, date_t, date_t1)
-        log.info(f"  Prefetch started for {date_t.isoformat()}")
+        # Kick off the first pending day's ERA5 fetch immediately
+        era5_future = _submit_era5(
+            pool, dates_todo[0], dates_todo[0] + datetime.timedelta(days=1))
+        log.info(f"  Prefetch started for {dates_todo[0].isoformat()}")
 
-        while date_t < end:
+        for i, date_t in enumerate(dates_todo):
             date_t1     = date_t + datetime.timedelta(days=1)
             date_t_str  = date_t.isoformat()
             date_t1_str = date_t1.isoformat()
@@ -666,11 +711,10 @@ def train(args):
                 ds_atm_t, ds_atm_t1, ds_lnd_t = era5_future.result()
             except Exception as exc:
                 log.warning(f"  SKIP {date_t_str}: ERA5 fetch failed: {exc}")
-                date_t = date_t1
-                if date_t < end:
-                    era5_future = _submit_era5(
-                        pool, date_t, date_t + datetime.timedelta(days=1))
-                    log.info(f"  Prefetch started for {date_t.isoformat()}")
+                if i + 1 < len(dates_todo):
+                    nxt = dates_todo[i + 1]
+                    era5_future = _submit_era5(pool, nxt, nxt + datetime.timedelta(days=1))
+                    log.info(f"  Prefetch started for {nxt.isoformat()}")
                 continue
             wait_s = time.perf_counter() - t_wait
             if wait_s < 2.0:
@@ -681,11 +725,10 @@ def train(args):
                          f"(GPU was faster than GCS fetch)")
 
             # ---- Submit next day's ERA5 fetch in background ----
-            date_next  = date_t1
-            date_next1 = date_next + datetime.timedelta(days=1)
-            if date_next < end:
-                era5_future = _submit_era5(pool, date_next, date_next1)
-                log.info(f"  Prefetch started for {date_next.isoformat()}")
+            if i + 1 < len(dates_todo):
+                nxt = dates_todo[i + 1]
+                era5_future = _submit_era5(pool, nxt, nxt + datetime.timedelta(days=1))
+                log.info(f"  Prefetch started for {nxt.isoformat()}")
 
             # ---- Build sample (GODAS + channels + HEALPix) ----
             try:
@@ -697,7 +740,6 @@ def train(args):
                 )
             except Exception as exc:
                 log.warning(f"  SKIP {date_t_str}: {exc}")
-                date_t = date_t1
                 continue
 
             del ds_atm_t, ds_atm_t1, ds_lnd_t  # free RAM once tensors are built
@@ -738,15 +780,19 @@ def train(args):
                 torch.save(model.state_dict(), args.checkpoint)
                 log.info(f"  Checkpoint saved  (best_loss={best_loss:.6f})")
 
+            # ---- Mark day done and persist progress ----
+            completed_dates.add(date_t_str)
+            save_progress(args.progress_file, completed_dates, best_loss)
+            log.info(f"  Progress saved  ({len(completed_dates)}/{len(all_dates)} days done)")
+
             del x, y, xb, yb
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             gc.collect()
 
-            date_t = date_t1
-
     log.info(f"Training complete. Best loss: {best_loss:.6f}")
     log.info(f"Model saved to: {args.checkpoint}")
+    log.info(f"Progress saved to: {args.progress_file}")
 
 
 # ---------------------------------------------------------------------------
@@ -762,6 +808,9 @@ def parse_args():
     p.add_argument("--godas-dir",       default=DEFAULT_GODAS_DIR)
     p.add_argument("--static-dir",      default=DEFAULT_STATIC_DIR)
     p.add_argument("--checkpoint",      default=DEFAULT_CHECKPOINT)
+    p.add_argument("--progress-file",   default="training_progress.json",
+                   help="JSON file tracking completed dates and best loss "
+                        "(auto-created; used to resume interrupted runs)")
     p.add_argument("--epochs-per-day",  type=int, default=5)
     return p.parse_args()
 
