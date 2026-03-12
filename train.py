@@ -23,6 +23,7 @@ import datetime
 import argparse
 import logging
 import time
+import threading
 import concurrent.futures
 
 import numpy as np
@@ -304,6 +305,36 @@ def save_progress(progress_path, completed_dates, best_loss):
             "best_loss": best_loss,
         }, f, indent=2)
     os.replace(tmp, progress_path)
+
+
+def _hf_upload(checkpoint_path, repo_id, best_loss, date_str):
+    """Upload checkpoint to HuggingFace Hub (runs in background thread)."""
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi()
+        api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
+        api.upload_file(
+            path_or_fileobj=checkpoint_path,
+            path_in_repo=os.path.basename(checkpoint_path),
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=f"Best model — loss={best_loss:.6f}  date={date_str}",
+        )
+        log.info(f"  HuggingFace upload complete: {repo_id}")
+    except Exception as exc:
+        log.warning(f"  HuggingFace upload failed: {exc}")
+
+
+def push_checkpoint_to_hub(checkpoint_path, repo_id, best_loss, date_str):
+    """Fire-and-forget background upload; does not block training."""
+    t = threading.Thread(
+        target=_hf_upload,
+        args=(checkpoint_path, repo_id, best_loss, date_str),
+        daemon=True,
+    )
+    t.start()
+    log.info(f"  HuggingFace upload started in background -> {repo_id}")
+    return t
 
 
 # ---------------------------------------------------------------------------
@@ -779,6 +810,9 @@ def train(args):
                 best_loss = mean_loss
                 torch.save(model.state_dict(), args.checkpoint)
                 log.info(f"  Checkpoint saved  (best_loss={best_loss:.6f})")
+                if args.hf_repo:
+                    push_checkpoint_to_hub(
+                        args.checkpoint, args.hf_repo, best_loss, date_t_str)
 
             # ---- Mark day done and persist progress ----
             completed_dates.add(date_t_str)
@@ -811,6 +845,10 @@ def parse_args():
     p.add_argument("--progress-file",   default="training_progress.json",
                    help="JSON file tracking completed dates and best loss "
                         "(auto-created; used to resume interrupted runs)")
+    p.add_argument("--hf-repo",         default=None,
+                   help="HuggingFace repo ID to push best checkpoint to "
+                        "(e.g. manmeet3591/ai-atmosphere-s2s). "
+                        "Requires HF_TOKEN env var or prior huggingface-cli login.")
     p.add_argument("--epochs-per-day",  type=int, default=5)
     return p.parse_args()
 
