@@ -1,0 +1,83 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/pytorch:25.01-py3
+
+# AI Atmosphere Model (S2S)
+# Base: NGC PyTorch 25.01 (PyTorch 2.6, CUDA 12.6 runtime, cuDNN 9)
+# Driver requirement: >= 525.85 (host has 580 — compatible)
+#
+# earth2grid v2025.7.1 requires torch>=2.10,<2.11.
+# We pin torch 2.10.0+cu128 below and rebuild earth2grid against it.
+# If you change the NGC base tag, re-verify torch compatibility.
+
+%post
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+
+    # ------------------------------------------------------------------
+    # 1. System packages needed by pygrib / matplotlib / scipy
+    # ------------------------------------------------------------------
+    apt-get update -y && apt-get install -y --no-install-recommends \
+        libeccodes-dev \
+        libeccodes-tools \
+        libgeos-dev \
+        libproj-dev \
+        proj-bin \
+        && rm -rf /var/lib/apt/lists/*
+
+    # ------------------------------------------------------------------
+    # 2. Pin PyTorch to the version earth2grid requires (2.10.0 + cu128)
+    #    Uninstall the NGC-bundled version first to avoid conflicts.
+    # ------------------------------------------------------------------
+    pip uninstall -y torch torchvision torchaudio || true
+    pip install --no-cache-dir \
+        torch==2.10.0 \
+        torchvision \
+        torchaudio \
+        --index-url https://download.pytorch.org/whl/cu128
+
+    # ------------------------------------------------------------------
+    # 3. Data / ML dependencies
+    # ------------------------------------------------------------------
+    pip install --no-cache-dir \
+        "xarray[complete]" \
+        zarr \
+        gcsfs \
+        "dask[complete]" \
+        "pygrib==2.1.6" \
+        eccodes \
+        diffusers \
+        accelerate \
+        scipy \
+        matplotlib \
+        einops
+
+    # ------------------------------------------------------------------
+    # 4. earth2grid — must be built against the pinned torch above
+    # ------------------------------------------------------------------
+    pip install --no-build-isolation --no-cache-dir \
+        https://github.com/NVlabs/earth2grid/archive/refs/tags/v2025.7.1.tar.gz
+
+    # ------------------------------------------------------------------
+    # 5. Smoke test
+    # ------------------------------------------------------------------
+    python -c "
+import torch, earth2grid, diffusers
+print('torch:', torch.__version__)
+print('CUDA available:', torch.cuda.is_available())
+print('earth2grid OK')
+print('diffusers:', diffusers.__version__)
+"
+
+%environment
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONUNBUFFERED=1
+    # Allow GCS anonymous access without credential warnings
+    export GCSFS_DEFAULT_TOKEN=anon
+
+%labels
+    Author earthmind-s2s
+    Version 1.0
+    Description AI Atmosphere diffusion model (S2S) environment
+
+%runscript
+    exec python "$@"

@@ -1,0 +1,7 @@
+*.sif
+*.pth
+__pycache__/
+*.pyc
+static_fields/
+*.grb
+.claude/
