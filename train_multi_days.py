@@ -125,10 +125,13 @@ def train(args):
             date_t.isoformat(), date_t1.isoformat(),
         )
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=B) as pool:
-        # Pre-fill with up to B parallel ERA5 fetches
+    # Prefetch workers: cap at 2 to avoid holding multiple full ERA5 days in RAM
+    # simultaneously. ERA5 daily compute is ~2 GB/day; 2 workers = ~4 GB overhead.
+    prefetch_workers = min(B, args.prefetch_workers)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=prefetch_workers) as pool:
+        # Pre-fill with up to prefetch_workers parallel ERA5 fetches
         future_queue = deque()
-        prefill = min(B, len(dates_todo))
+        prefill = min(prefetch_workers, len(dates_todo))
         for i in range(prefill):
             future_queue.append((dates_todo[i], _submit(pool, dates_todo[i])))
             log.info(f"  Prefetch started for {dates_todo[i].isoformat()}")
@@ -267,9 +270,12 @@ def parse_args():
                    help="Shared with train.py — resume works across both scripts")
     p.add_argument("--hf-repo",           default=None,
                    help="HuggingFace repo ID (e.g. sluitel/ai-atmosphere-s2s)")
-    p.add_argument("--batch-days",        type=int, default=32,
-                   help="Days per GPU batch (default: 32). "
-                        "On a 98 GB GPU try 32→64→80 until ~80%% VRAM used.")
+    p.add_argument("--batch-days",        type=int, default=8,
+                   help="Days per GPU batch (default: 8). "
+                        "Increase until ~80%% VRAM used (watch nvidia-smi).")
+    p.add_argument("--prefetch-workers",  type=int, default=2,
+                   help="Parallel ERA5 GCS fetches (default: 2). "
+                        "Each fetch holds ~2 GB of system RAM; keep low to avoid OOM.")
     p.add_argument("--epochs-per-batch",  type=int, default=5,
                    help="Training epochs per batch (default: 5)")
     return p.parse_args()
