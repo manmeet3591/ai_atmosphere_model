@@ -1,17 +1,18 @@
 """
 AI Atmosphere Model — Multi-day batched training
 ================================================
-Identical physics to train.py but loads B consecutive days into a single
-GPU batch to fill available VRAM.
+Loads B consecutive days into a single GPU batch to fill VRAM.
 
-Prefetch strategy:
-  - ThreadPoolExecutor(max_workers=B) keeps B ERA5 GCS fetches running
-    concurrently.
-  - While the GPU trains on batch i, the pool is already fetching batch i+1.
-  - build_sample (GODAS + channels + HEALPix) is sequential but fast (<2 s/day).
+Key optimisations vs train.py:
+  1. Batch ERA5 fetch  — fetch all B days in ONE GCS .compute() call
+                         instead of B × 300 s individual calls.
+  2. Batch prefetch    — while GPU trains on batch i, a background thread
+                         fetches batch i+1 ERA5 data (hides ~400 s wait).
+  3. GODAS file cache  — pentad files shared across many days; cache in
+                         RAM to avoid re-reading the same file repeatedly.
 
 Usage:
-  python train_multi_days.py [--batch-days 4] [--epochs-per-batch 5] ...
+  python train_multi_days.py [--batch-days 48] [--epochs-per-batch 8] ...
 """
 
 import os
@@ -22,7 +23,6 @@ import argparse
 import logging
 import time
 import concurrent.futures
-from collections import deque
 
 import numpy as np
 import torch
@@ -42,11 +42,14 @@ from train import (
     build_regridder,
     prepare_static_fields,
     build_model,
-    fetch_era5_for_day,
+    fetch_era5_date_range,
     build_sample,
     load_progress,
     save_progress,
     push_checkpoint_to_hub,
+    _read_godas_grib_eccodes,
+    ensure_lat_ascending,
+    standardize_latlon,
     COND_CHANNELS,
     TARGET_CHANNELS,
     CROSS_ATTN_DIM,
@@ -54,6 +57,7 @@ from train import (
     DEFAULT_STATIC_DIR,
     DEFAULT_CHECKPOINT,
 )
+import xarray as xr
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,6 +65,40 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# GODAS file cache (pentad files are shared across ~5 consecutive days)
+# ---------------------------------------------------------------------------
+
+_godas_file_cache: dict = {}
+
+
+def load_godas_cached(godas_index, date_str):
+    """
+    Load GODAS for date_str with per-file RAM caching.
+    GODAS pentad files cover ~5 days, so the same file is reused for
+    consecutive days in a batch — reading it once saves ~13 s/reuse.
+    """
+    target = np.datetime64(date_str, "D")
+    prior  = [(t, p) for t, p in godas_index if t <= target]
+    if not prior:
+        raise ValueError(f"No GODAS data on or before {date_str}")
+    _, fpath = prior[-1]
+
+    if fpath not in _godas_file_cache:
+        t_das, s_das = _read_godas_grib_eccodes(fpath)
+        if not t_das:
+            raise RuntimeError(f"No temperature data in {fpath}")
+        ds = xr.Dataset({
+            "potential_temperature": xr.concat(t_das, dim="level"),
+            "salinity":              xr.concat(s_das, dim="level") if s_das else
+                                     xr.concat(t_das, dim="level") * float("nan"),
+        })
+        _godas_file_cache[fpath] = standardize_latlon(ensure_lat_ascending(ds))
+        log.debug(f"  GODAS cached: {os.path.basename(fpath)}")
+
+    return _godas_file_cache[fpath]
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +130,10 @@ def train(args):
     completed_dates, best_loss = load_progress(args.progress_file)
     if args.checkpoint and os.path.exists(args.checkpoint):
         log.info(f"Loading weights from checkpoint: {args.checkpoint}")
-        model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+        try:
+            model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+        except RuntimeError as e:
+            log.warning(f"  Checkpoint incompatible — starting from scratch. {e}")
 
     # -- Date list --
     start = datetime.date.fromisoformat(args.start_date)
@@ -113,75 +154,73 @@ def train(args):
         log.info("All dates already completed. Nothing to do.")
         return
 
+    # -- Group into batches of B --
+    B = args.batch_days
+    batches = [dates_todo[i:i+B] for i in range(0, len(dates_todo), B)]
+    log.info(f"  {len(batches)} batches of up to {B} days each")
+
     model.train()
     step = 0
-    B = args.batch_days
 
-    def _submit(pool, date_t):
-        date_t1 = date_t + datetime.timedelta(days=1)
-        return pool.submit(
-            fetch_era5_for_day,
-            ds_atmos, ds_land,
-            date_t.isoformat(), date_t1.isoformat(),
-        )
+    def _submit_batch(pool, date_batch):
+        return pool.submit(fetch_era5_date_range, ds_atmos, ds_land, date_batch)
 
-    # prefetch_workers controls RAM (2 concurrent ERA5 fetches = ~4 GB overhead).
-    # B controls GPU batch size. We accumulate B samples using a sliding window
-    # of prefetch_workers futures — separating RAM safety from batch size.
-    prefetch_workers = min(B, args.prefetch_workers)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=prefetch_workers) as pool:
-        # Sliding-window prefetch: always keep prefetch_workers futures in flight
-        future_queue = deque()
-        prefill = min(prefetch_workers, len(dates_todo))
-        for i in range(prefill):
-            future_queue.append((dates_todo[i], _submit(pool, dates_todo[i])))
-            log.info(f"  Prefetch started for {dates_todo[i].isoformat()}")
-        next_idx = prefill
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        # Prefetch first batch immediately
+        era5_future = _submit_batch(pool, batches[0])
+        log.info(f"  ERA5 prefetch started: batch 1/{len(batches)}  "
+                 f"({batches[0][0]} .. {batches[0][-1]})")
 
-        batch_X, batch_Y, dates_in_batch = [], [], []
-
-        while future_queue:
-            # ---- Pull one sample at a time, replenish the sliding window ----
-            date_t, future = future_queue.popleft()
-
-            # Immediately submit the next future to keep the pool busy
-            if next_idx < len(dates_todo):
-                nxt = dates_todo[next_idx]
-                future_queue.append((nxt, _submit(pool, nxt)))
-                log.info(f"  Prefetch started for {nxt.isoformat()}")
-                next_idx += 1
-
-            date_t1     = date_t + datetime.timedelta(days=1)
-            date_t_str  = date_t.isoformat()
-            date_t1_str = date_t1.isoformat()
-
+        for bi, date_batch in enumerate(batches):
+            # ---- Wait for this batch's ERA5 ----
             t_wait = time.perf_counter()
             try:
-                ds_atm_t, ds_atm_t1, ds_lnd_t = future.result()
+                era5_map = era5_future.result()  # dict: date_str -> (atm_t, atm_t1, lnd_t)
             except Exception as exc:
-                log.warning(f"  SKIP {date_t_str}: ERA5 failed: {exc}")
+                log.warning(f"  SKIP batch {bi+1}: ERA5 fetch failed: {exc}")
+                if bi + 1 < len(batches):
+                    era5_future = _submit_batch(pool, batches[bi + 1])
                 continue
             wait_s = time.perf_counter() - t_wait
-            log.info(f"  [{date_t_str}] ERA5 ready  wait={wait_s:.1f}s")
+            log.info(f"  Batch {bi+1}/{len(batches)} ERA5 ready  wait={wait_s:.1f}s  "
+                     f"({len(era5_map)} days fetched)")
 
-            try:
-                xb, yb = build_sample(
-                    date_t_str, date_t1_str,
-                    ds_atm_t, ds_atm_t1, ds_lnd_t,
-                    godas_index, ds_stat, ref_lat, ref_lon, regridder,
-                )
-            except Exception as exc:
-                log.warning(f"  SKIP {date_t_str}: sample build failed: {exc}")
-                continue
+            # ---- Prefetch next batch in background ----
+            if bi + 1 < len(batches):
+                era5_future = _submit_batch(pool, batches[bi + 1])
+                log.info(f"  ERA5 prefetch started: batch {bi+2}/{len(batches)}  "
+                         f"({batches[bi+1][0]} .. {batches[bi+1][-1]})")
 
-            del ds_atm_t, ds_atm_t1, ds_lnd_t
-            batch_X.append(xb)
-            batch_Y.append(yb)
-            dates_in_batch.append(date_t_str)
+            # ---- Build samples (GODAS from cache + channels + HEALPix) ----
+            batch_X, batch_Y, dates_in_batch = [], [], []
 
-            # ---- Train when we have B samples or the queue is exhausted ----
-            if len(batch_X) < B and future_queue:
-                continue  # keep accumulating
+            for date_t in date_batch:
+                date_t_str  = date_t.isoformat()
+                date_t1_str = (date_t + datetime.timedelta(days=1)).isoformat()
+
+                if date_t_str not in era5_map:
+                    log.warning(f"  SKIP {date_t_str}: not in ERA5 batch result")
+                    continue
+                ds_atm_t, ds_atm_t1, ds_lnd_t = era5_map[date_t_str]
+
+                try:
+                    ds_ocn_t = load_godas_cached(godas_index, date_t_str)
+                    xb, yb = build_sample(
+                        date_t_str, date_t1_str,
+                        ds_atm_t, ds_atm_t1, ds_lnd_t,
+                        godas_index, ds_stat, ref_lat, ref_lon, regridder,
+                        ds_ocn=ds_ocn_t,
+                    )
+                except Exception as exc:
+                    log.warning(f"  SKIP {date_t_str}: sample build failed: {exc}")
+                    continue
+
+                batch_X.append(xb)
+                batch_Y.append(yb)
+                dates_in_batch.append(date_t_str)
+
+            del era5_map
+            gc.collect()
 
             if not batch_X:
                 continue
@@ -193,10 +232,9 @@ def train(args):
             del batch_X, batch_Y
 
             enc_hid = torch.zeros(N, 1, CROSS_ATTN_DIM, device=device)
-
-            log.info(f"  === GPU batch: {N} days  {dates_in_batch[0]} .. "
-                     f"{dates_in_batch[-1]}  "
-                     f"X{list(X.shape)}  Y{list(Y.shape)} ===")
+            log.info(f"  === GPU batch {bi+1}: {N} days  "
+                     f"{dates_in_batch[0]} .. {dates_in_batch[-1]}  "
+                     f"X{list(X.shape)} ===")
 
             # ---- Training epochs ----
             batch_losses = []
@@ -222,8 +260,7 @@ def train(args):
                 loss_val = loss.item()
                 batch_losses.append(loss_val)
                 step += 1
-                log.info(f"  {dates_in_batch[0]}+{N-1}d  "
-                         f"epoch {epoch:02d}/{args.epochs_per_batch}  "
+                log.info(f"  batch {bi+1}  epoch {epoch:02d}/{args.epochs_per_batch}  "
                          f"loss={loss_val:.6f}  step={step}")
 
                 del noise, noisy_Y, net_input, noise_pred, loss
@@ -250,12 +287,8 @@ def train(args):
                 torch.cuda.empty_cache()
             gc.collect()
 
-            # Reset accumulators for next batch
-            batch_X, batch_Y, dates_in_batch = [], [], []
-
     log.info(f"Training complete. Best loss: {best_loss:.6f}")
     log.info(f"Model saved to: {args.checkpoint}")
-    log.info(f"Progress saved to: {args.progress_file}")
 
 
 # ---------------------------------------------------------------------------
@@ -266,22 +299,18 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="AI Atmosphere S2S — Multi-day batched diffusion training")
     p.add_argument("--start-date",        default="2018-01-06")
-    p.add_argument("--end-date",          default="2018-08-13")
+    p.add_argument("--end-date",          default="2022-01-01")
     p.add_argument("--godas-dir",         default=DEFAULT_GODAS_DIR)
     p.add_argument("--static-dir",        default=DEFAULT_STATIC_DIR)
     p.add_argument("--checkpoint",        default=DEFAULT_CHECKPOINT)
     p.add_argument("--progress-file",     default="training_progress.json",
                    help="Shared with train.py — resume works across both scripts")
     p.add_argument("--hf-repo",           default=None,
-                   help="HuggingFace repo ID (e.g. sluitel/ai-atmosphere-s2s)")
-    p.add_argument("--batch-days",        type=int, default=8,
-                   help="Days per GPU batch (default: 8). "
-                        "Increase until ~80%% VRAM used (watch nvidia-smi).")
-    p.add_argument("--prefetch-workers",  type=int, default=2,
-                   help="Parallel ERA5 GCS fetches (default: 2). "
-                        "Each fetch holds ~2 GB of system RAM; keep low to avoid OOM.")
-    p.add_argument("--epochs-per-batch",  type=int, default=5,
-                   help="Training epochs per batch (default: 5)")
+                   help="HuggingFace repo ID (e.g. dsocairlab/Earthmind-S2S)")
+    p.add_argument("--batch-days",        type=int, default=48,
+                   help="Days per GPU batch (default: 48)")
+    p.add_argument("--epochs-per-batch",  type=int, default=8,
+                   help="Training epochs per batch (default: 8)")
     return p.parse_args()
 
 

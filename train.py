@@ -494,6 +494,49 @@ def fetch_era5_for_day(ds_atmos, ds_land, date_t_str, date_t1_str):
     return ds_atm_t, ds_atm_t1, ds_lnd_t
 
 
+def fetch_era5_date_range(ds_atmos, ds_land, dates_list):
+    """
+    Fetch ERA5 for a list of dates in ONE GCS .compute() call.
+    Far faster than one call per day for large batches.
+
+    Args:
+        dates_list: list of datetime.date objects (the input dates t).
+                    Targets are dates_list[i] + 1 day.
+    Returns:
+        dict mapping date_str -> (ds_atm_t, ds_atm_t1, ds_lnd_t) in-memory.
+    """
+    if not dates_list:
+        return {}
+
+    date_start  = dates_list[0].isoformat()
+    # Need t+1 for the last date's target
+    date_end_t1 = (dates_list[-1] + datetime.timedelta(days=1)).isoformat()
+    # For land we only need t, not t+1
+    date_end    = dates_list[-1].isoformat()
+
+    atm_win    = ensure_lat_ascending(
+                     ds_atmos.sel(time=slice(date_start, date_end_t1)))
+    ds_atm_daily = daily_mean(atm_win).compute()   # single GCS batch
+
+    lnd_win    = ensure_lat_ascending(
+                     ds_land.sel(time=slice(date_start, date_end)))
+    ds_lnd_daily = daily_mean(lnd_win).compute()   # single GCS batch
+
+    result = {}
+    for d in dates_list:
+        d_str  = d.isoformat()
+        d1_str = (d + datetime.timedelta(days=1)).isoformat()
+        try:
+            result[d_str] = (
+                pick_single_day(ds_atm_daily, d_str),
+                pick_single_day(ds_atm_daily, d1_str),
+                pick_single_day(ds_lnd_daily, d_str),
+            )
+        except KeyError as e:
+            log.warning(f"  ERA5 date missing in batch: {e}")
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Build one training sample (ERA5 already in RAM — only GODAS + channels)
 # ---------------------------------------------------------------------------
@@ -501,10 +544,14 @@ def fetch_era5_for_day(ds_atmos, ds_land, date_t_str, date_t1_str):
 def build_sample(date_t_str, date_t1_str,
                  ds_atm_t, ds_atm_t1, ds_lnd_t,
                  godas_index, ds_stat,
-                 ref_lat, ref_lon, regridder):
+                 ref_lat, ref_lon, regridder,
+                 ds_ocn=None):
     """
     ds_atm_t / ds_atm_t1 / ds_lnd_t must be pre-fetched in-memory datasets
-    (from fetch_era5_for_day).
+    (from fetch_era5_for_day or fetch_era5_date_range).
+
+    ds_ocn: optional pre-loaded GODAS xr.Dataset (e.g. from a RAM cache).
+            If None, loads from godas_index using load_godas_for_date().
 
     Returns:
         xb: [1, 20, 12, nside, nside]
@@ -514,9 +561,13 @@ def build_sample(date_t_str, date_t1_str,
     t0 = time.perf_counter()
 
     t2 = time.perf_counter()
-    log.info(f"  [{tag}] Loading GODAS ocean snapshot ...")
-    ds_ocn_t = load_godas_for_date(godas_index, date_t_str)
-    log.info(f"  [{tag}] GODAS load done  ({time.perf_counter()-t2:.1f}s)")
+    if ds_ocn is None:
+        log.info(f"  [{tag}] Loading GODAS ocean snapshot ...")
+        ds_ocn_t = load_godas_for_date(godas_index, date_t_str)
+        log.info(f"  [{tag}] GODAS load done  ({time.perf_counter()-t2:.1f}s)")
+    else:
+        ds_ocn_t = ds_ocn
+        log.debug(f"  [{tag}] GODAS from cache")
 
     t3 = time.perf_counter()
     log.info(f"  [{tag}] Regriding ocean to ERA5 grid ...")
