@@ -49,26 +49,25 @@ TRAIN_TIME_BUDGET  = 900  # wall-clock seconds of pure training (15 min)
 # ---------------------------------------------------------------------------
 
 # UNet3D architecture
-BLOCK_OUT_CHANNELS   = (256, 512, 1024, 1024)   # channel sizes per resolution level
+BLOCK_OUT_CHANNELS   = (64, 128, 256, 256)      # tiny conv-only model — max steps/15min
 LAYERS_PER_BLOCK     = 2                         # ResNet layers per UNet block
 NORM_NUM_GROUPS      = 32                        # GroupNorm groups (must divide all channels)
-CROSS_ATTN_DIM       = 1                         # cross-attention dim (keep at 1 unless adding conditioning)
-ATTENTION_HEAD_DIM   = 64                        # attention head dim (must divide block channels)
+CROSS_ATTN_DIM       = 1                         # cross-attention dim (keep at 1)
+ATTENTION_HEAD_DIM   = 32                        # attention head dim
 
-# Down/Up block types (must be same length as BLOCK_OUT_CHANNELS)
-# Options: "DownBlock3D", "CrossAttnDownBlock3D"
-#          "UpBlock3D",   "CrossAttnUpBlock3D"
+# Pure conv UNet — no attention anywhere — removes 12K-token attention bottleneck
+# Goal: establish that training converges at all before adding expensive attention back
 DOWN_BLOCK_TYPES = (
-    "DownBlock3D",            # level 0: 64×64 spatial, pure conv (efficient)
-    "CrossAttnDownBlock3D",   # level 1: 32×32, global attention
-    "CrossAttnDownBlock3D",   # level 2: 16×16, global attention
-    "CrossAttnDownBlock3D",   # level 3:  8×8,  global attention
+    "DownBlock3D",   # level 0: 64×64
+    "DownBlock3D",   # level 1: 32×32
+    "DownBlock3D",   # level 2: 16×16
+    "DownBlock3D",   # level 3:  8×8
 )
 UP_BLOCK_TYPES = (
-    "CrossAttnUpBlock3D",     # mirror of level 3
-    "CrossAttnUpBlock3D",     # mirror of level 2
-    "CrossAttnUpBlock3D",     # mirror of level 1
-    "UpBlock3D",              # mirror of level 0
+    "UpBlock3D",     # mirror of level 3
+    "UpBlock3D",     # mirror of level 2
+    "UpBlock3D",     # mirror of level 1
+    "UpBlock3D",     # mirror of level 0
 )
 
 # Diffusion scheduler — try LCMScheduler or DDPMScheduler
@@ -76,13 +75,15 @@ SCHEDULER_CLASS    = DDPMScheduler
 NUM_TRAIN_TIMESTEPS = 1000
 
 # Optimizer
-LR           = 5e-4
+LR           = 2e-3
 WEIGHT_DECAY = 1e-2
 GRAD_CLIP    = 1.0   # set to None to disable gradient clipping
 
-# Batch size (number of days per GPU step)
-# (256,512,1024,1024) with 12-face HEALPix needs batch 1 — attention is 12×64×64 tokens
-BATCH_SIZE = 1
+# Batch size
+BATCH_SIZE = 4
+
+# LR warmup steps (linear ramp from 0 → LR); 0 = no warmup
+WARMUP_STEPS = 200
 
 # ---------------------------------------------------------------------------
 # Fixed infrastructure — do NOT modify below this line
@@ -204,6 +205,12 @@ def train(args):
         if GRAD_CLIP is not None:
             nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         optimizer.step()
+
+        # Linear LR warmup
+        if WARMUP_STEPS > 0 and step < WARMUP_STEPS:
+            lr_scale = (step + 1) / WARMUP_STEPS
+            for pg in optimizer.param_groups:
+                pg['lr'] = LR * lr_scale
 
         step += 1
         if step % 50 == 0:
