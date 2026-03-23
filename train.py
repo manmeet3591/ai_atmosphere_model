@@ -494,6 +494,49 @@ def fetch_era5_for_day(ds_atmos, ds_land, date_t_str, date_t1_str):
     return ds_atm_t, ds_atm_t1, ds_lnd_t
 
 
+def fetch_era5_date_range(ds_atmos, ds_land, dates_list):
+    """
+    Fetch ERA5 for a list of dates in ONE GCS .compute() call.
+    Far faster than one call per day for large batches.
+
+    Args:
+        dates_list: list of datetime.date objects (the input dates t).
+                    Targets are dates_list[i] + 1 day.
+    Returns:
+        dict mapping date_str -> (ds_atm_t, ds_atm_t1, ds_lnd_t) in-memory.
+    """
+    if not dates_list:
+        return {}
+
+    date_start  = dates_list[0].isoformat()
+    # Need t+1 for the last date's target
+    date_end_t1 = (dates_list[-1] + datetime.timedelta(days=1)).isoformat()
+    # For land we only need t, not t+1
+    date_end    = dates_list[-1].isoformat()
+
+    atm_win    = ensure_lat_ascending(
+                     ds_atmos.sel(time=slice(date_start, date_end_t1)))
+    ds_atm_daily = daily_mean(atm_win).compute()   # single GCS batch
+
+    lnd_win    = ensure_lat_ascending(
+                     ds_land.sel(time=slice(date_start, date_end)))
+    ds_lnd_daily = daily_mean(lnd_win).compute()   # single GCS batch
+
+    result = {}
+    for d in dates_list:
+        d_str  = d.isoformat()
+        d1_str = (d + datetime.timedelta(days=1)).isoformat()
+        try:
+            result[d_str] = (
+                pick_single_day(ds_atm_daily, d_str),
+                pick_single_day(ds_atm_daily, d1_str),
+                pick_single_day(ds_lnd_daily, d_str),
+            )
+        except KeyError as e:
+            log.warning(f"  ERA5 date missing in batch: {e}")
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Build one training sample (ERA5 already in RAM — only GODAS + channels)
 # ---------------------------------------------------------------------------
@@ -501,10 +544,14 @@ def fetch_era5_for_day(ds_atmos, ds_land, date_t_str, date_t1_str):
 def build_sample(date_t_str, date_t1_str,
                  ds_atm_t, ds_atm_t1, ds_lnd_t,
                  godas_index, ds_stat,
-                 ref_lat, ref_lon, regridder):
+                 ref_lat, ref_lon, regridder,
+                 ds_ocn=None):
     """
     ds_atm_t / ds_atm_t1 / ds_lnd_t must be pre-fetched in-memory datasets
-    (from fetch_era5_for_day).
+    (from fetch_era5_for_day or fetch_era5_date_range).
+
+    ds_ocn: optional pre-loaded GODAS xr.Dataset (e.g. from a RAM cache).
+            If None, loads from godas_index using load_godas_for_date().
 
     Returns:
         xb: [1, 20, 12, nside, nside]
@@ -514,9 +561,13 @@ def build_sample(date_t_str, date_t1_str,
     t0 = time.perf_counter()
 
     t2 = time.perf_counter()
-    log.info(f"  [{tag}] Loading GODAS ocean snapshot ...")
-    ds_ocn_t = load_godas_for_date(godas_index, date_t_str)
-    log.info(f"  [{tag}] GODAS load done  ({time.perf_counter()-t2:.1f}s)")
+    if ds_ocn is None:
+        log.info(f"  [{tag}] Loading GODAS ocean snapshot ...")
+        ds_ocn_t = load_godas_for_date(godas_index, date_t_str)
+        log.info(f"  [{tag}] GODAS load done  ({time.perf_counter()-t2:.1f}s)")
+    else:
+        ds_ocn_t = ds_ocn
+        log.debug(f"  [{tag}] GODAS from cache")
 
     t3 = time.perf_counter()
     log.info(f"  [{tag}] Regriding ocean to ERA5 grid ...")
@@ -636,21 +687,50 @@ def build_sample(date_t_str, date_t1_str,
 
 COND_CHANNELS   = 20
 TARGET_CHANNELS = 14
-CROSS_ATTN_DIM  = 1
+CROSS_ATTN_DIM  = 1   # cross-attention context dim (encoder_hidden_states)
 
 
 def build_model(device):
+    """
+    Scaled-up 3D UNet for 98 GB GPU.
+
+    Architecture:
+      Level 0  (64×64): DownBlock3D / UpBlock3D  — pure conv, large spatial
+      Level 1  (32×32): CrossAttnDownBlock3D      — self-attn: 1024 tokens/face
+      Level 2  (16×16): CrossAttnDownBlock3D      — self-attn:  256 tokens/face
+      Level 3  ( 8×8 ): CrossAttnDownBlock3D      — self-attn:   64 tokens/face
+
+    Self-attention at levels 1-3 provides global receptive field needed for
+    S2S teleconnections (ENSO → global). Cross-attention conditions on
+    encoder_hidden_states (currently zero-padded; extend later for e.g. ENSO index).
+
+    block_out_channels=(256,512,1024,1024): ~16× capacity vs. prior (64,128,256,512).
+    attention_head_dim=64: 4/8/16 heads at each level (richer per-head repr.).
+    norm_num_groups=32: standard for models of this scale.
+
+    NOTE: incompatible with old (64,128,256,512) checkpoints — start fresh.
+    """
     model = UNet3DConditionModel(
         sample_size=None,
         in_channels=TARGET_CHANNELS + COND_CHANNELS,
         out_channels=TARGET_CHANNELS,
         layers_per_block=2,
-        block_out_channels=(64, 128, 256, 512),
-        down_block_types=("DownBlock3D", "DownBlock3D", "DownBlock3D", "DownBlock3D"),
-        up_block_types=("UpBlock3D",   "UpBlock3D",   "UpBlock3D",   "UpBlock3D"),
-        norm_num_groups=8,
+        block_out_channels=(256, 512, 1024, 1024),
+        down_block_types=(
+            "DownBlock3D",           # level 0: 64×64, pure conv
+            "CrossAttnDownBlock3D",  # level 1: 32×32, 1024 tokens/face
+            "CrossAttnDownBlock3D",  # level 2: 16×16,  256 tokens/face
+            "CrossAttnDownBlock3D",  # level 3:  8×8,    64 tokens/face
+        ),
+        up_block_types=(
+            "CrossAttnUpBlock3D",    # level 3 mirror
+            "CrossAttnUpBlock3D",    # level 2 mirror
+            "CrossAttnUpBlock3D",    # level 1 mirror
+            "UpBlock3D",             # level 0 mirror
+        ),
+        norm_num_groups=32,
         cross_attention_dim=CROSS_ATTN_DIM,
-        attention_head_dim=8,
+        attention_head_dim=64,
     ).to(device)
     log.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     return model
@@ -691,7 +771,11 @@ def train(args):
     # -- Load best weights if checkpoint exists --
     if args.checkpoint and os.path.exists(args.checkpoint):
         log.info(f"Loading weights from checkpoint: {args.checkpoint}")
-        model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+        try:
+            model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+        except RuntimeError as e:
+            log.warning(f"  Checkpoint incompatible with current architecture "
+                        f"(likely old model size) — starting from scratch. Error: {e}")
 
     encoder_hidden = torch.zeros(1, 1, CROSS_ATTN_DIM, device=device)
 

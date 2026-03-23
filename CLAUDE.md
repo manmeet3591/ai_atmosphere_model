@@ -81,3 +81,60 @@ EPOCHS_PER_DAY = 5
 - `fill_nan_nearest_2d(da2d)` — KDTree-based NaN filling for static fields (handles coastal gaps after linear interp)
 - `norm_minmax(arr, vname)` — applies hardcoded min-max normalization
 - `ocean_nearest_prior(ds_ocean, target_time)` — selects most recent ocean snapshot before target date (GODAS is pentad, not daily)
+
+---
+
+## Autoresearch NAS Setup (added Mar 2026)
+
+Inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch). An AI agent autonomously searches for the best UNet3D architecture and hyperparameters by running 15-minute experiments on pre-cached HEALPix tensors.
+
+### Files (do NOT delete)
+
+| File | Role |
+|------|------|
+| `prepare_search.py` | **Fixed.** One-time ERA5 fetch → caches tensors to `search_cache/`. Do not modify. |
+| `train_search.py` | **Agent edits this.** Model arch + hyperparams + 15-min fixed training loop. |
+| `program_atmos.md` | **Human edits this.** Research org instructions for the Claude Code agent. |
+| `results_search.tsv` | Experiment log (untracked by git). |
+
+### Workflow
+
+**Step 1 — Prep (run once, ~30-60 min):**
+```bash
+CUDA_VISIBLE_DEVICES=1 apptainer exec --nv --env PYTHONNOUSERSITE=1 \
+  --bind /media/airlab/ROCSTOR:/media/airlab/ROCSTOR \
+  /media/airlab/ROCSTOR/earthmind_s2s/ai_atmosphere_model/ai_atmosphere.sif \
+  python3 prepare_search.py \
+  --godas-dir /media/airlab/ROCSTOR/earthmind_s2s/godas_pentad \
+  --static-dir /media/airlab/ROCSTOR/earthmind_s2s/static_fields
+```
+Caches 20 train days (2018-01-06 to 2018-01-25) + 10 val days (2018-07-01 to 2018-07-10) as `.pt` files in `search_cache/`.
+
+**Step 2 — Run one experiment:**
+```bash
+CUDA_VISIBLE_DEVICES=1 apptainer exec --nv --env PYTHONNOUSERSITE=1 \
+  --bind /media/airlab/ROCSTOR:/media/airlab/ROCSTOR \
+  /media/airlab/ROCSTOR/earthmind_s2s/ai_atmosphere_model/ai_atmosphere.sif \
+  python3 train_search.py > run_search.log 2>&1
+grep "^val_loss:" run_search.log
+```
+
+**Step 3 — Launch the agent loop:**
+Open a new Claude Code session in this directory and say:
+> "Have a look at `program_atmos.md` and let's kick off a new experiment!"
+
+The agent loops forever: modify `train_search.py` → run → check val_loss → keep/discard → repeat.
+
+### What the agent searches
+- `BLOCK_OUT_CHANNELS` — e.g. `(64,128,256,512)` vs `(256,512,1024,1024)`
+- `LAYERS_PER_BLOCK`, `ATTENTION_HEAD_DIM`, which levels have cross-attention
+- `LR`, `WEIGHT_DECAY`, `GRAD_CLIP`
+- `LCMScheduler` vs `DDPMScheduler`, `NUM_TRAIN_TIMESTEPS`
+- `BATCH_SIZE`
+
+### Metric
+`val_loss` = MSE on noise prediction for held-out validation days. **Lower is better.**
+
+### Hardware
+Single NVIDIA RTX PRO 6000 Blackwell (98 GB VRAM), `CUDA_VISIBLE_DEVICES=1`.
+All scripts run inside `ai_atmosphere.sif` via Apptainer (not bare system Python).
