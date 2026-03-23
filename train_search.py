@@ -55,19 +55,20 @@ NORM_NUM_GROUPS      = 32                        # GroupNorm groups (must divide
 CROSS_ATTN_DIM       = 1                         # cross-attention dim (keep at 1)
 ATTENTION_HEAD_DIM   = 32                        # attention head dim
 
-# Pure conv UNet — no attention anywhere — removes 12K-token attention bottleneck
-# Goal: establish that training converges at all before adding expensive attention back
+# Attention ONLY at bottleneck (level 3, 8×8 = 768 tokens total across 12 faces).
+# Gives global receptive field for teleconnections (ENSO→global) at minimal cost.
+# Level 0-2 remain pure conv for speed.
 DOWN_BLOCK_TYPES = (
-    "DownBlock3D",   # level 0: 64×64
-    "DownBlock3D",   # level 1: 32×32
-    "DownBlock3D",   # level 2: 16×16
-    "DownBlock3D",   # level 3:  8×8
+    "DownBlock3D",            # level 0: 64×64, pure conv
+    "DownBlock3D",            # level 1: 32×32, pure conv
+    "DownBlock3D",            # level 2: 16×16, pure conv
+    "CrossAttnDownBlock3D",   # level 3:  8×8,  768 tokens — cheap global attn
 )
 UP_BLOCK_TYPES = (
-    "UpBlock3D",     # mirror of level 3
-    "UpBlock3D",     # mirror of level 2
-    "UpBlock3D",     # mirror of level 1
-    "UpBlock3D",     # mirror of level 0
+    "CrossAttnUpBlock3D",     # mirror of level 3
+    "UpBlock3D",              # mirror of level 2
+    "UpBlock3D",              # mirror of level 1
+    "UpBlock3D",              # mirror of level 0
 )
 
 # Diffusion scheduler — try LCMScheduler or DDPMScheduler
