@@ -72,11 +72,11 @@ UP_BLOCK_TYPES = (
 )
 
 # Diffusion scheduler — try LCMScheduler or DDPMScheduler
-SCHEDULER_CLASS    = LCMScheduler
+SCHEDULER_CLASS    = DDPMScheduler
 NUM_TRAIN_TIMESTEPS = 1000
 
 # Optimizer
-LR           = 1e-4
+LR           = 5e-4
 WEIGHT_DECAY = 1e-2
 GRAD_CLIP    = 1.0   # set to None to disable gradient clipping
 
