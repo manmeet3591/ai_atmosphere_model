@@ -81,8 +81,8 @@ WEIGHT_DECAY = 1e-2
 GRAD_CLIP    = 1.0   # set to None to disable gradient clipping
 
 # Batch size (number of days per GPU step)
-# With 98 GB VRAM: batch 4 works for the baseline (256,512,1024,1024) arch
-BATCH_SIZE = 4
+# (256,512,1024,1024) with 12-face HEALPix needs batch 1 — attention is 12×64×64 tokens
+BATCH_SIZE = 1
 
 # ---------------------------------------------------------------------------
 # Fixed infrastructure — do NOT modify below this line
