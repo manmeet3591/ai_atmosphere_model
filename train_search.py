@@ -49,8 +49,8 @@ TRAIN_TIME_BUDGET  = 900  # wall-clock seconds of pure training (15 min)
 # ---------------------------------------------------------------------------
 
 # UNet3D architecture
-BLOCK_OUT_CHANNELS   = (64, 128, 256, 256)      # tiny conv-only model — max steps/15min
-LAYERS_PER_BLOCK     = 2                         # ResNet layers per UNet block
+BLOCK_OUT_CHANNELS   = (64, 128, 256, 256)      # 4-level (confirmed best depth)
+LAYERS_PER_BLOCK     = 1                         # fewer blocks/level — more steps, less expressive
 NORM_NUM_GROUPS      = 32                        # GroupNorm groups (must divide all channels)
 CROSS_ATTN_DIM       = 1                         # cross-attention dim (keep at 1)
 ATTENTION_HEAD_DIM   = 32                        # attention head dim
