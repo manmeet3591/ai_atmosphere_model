@@ -55,18 +55,17 @@ NORM_NUM_GROUPS      = 32                        # GroupNorm groups (must divide
 CROSS_ATTN_DIM       = 1                         # cross-attention dim (keep at 1)
 ATTENTION_HEAD_DIM   = 32                        # attention head dim
 
-# Attention ONLY at bottleneck (level 3, 8×8 = 768 tokens total across 12 faces).
-# Gives global receptive field for teleconnections (ENSO→global) at minimal cost.
-# Level 0-2 remain pure conv for speed.
+# CrossAttn at levels 2-3 (16×16=3072 + 8×8=768 tokens = 3840 total).
+# More global receptive field for teleconnections than level 3 only.
 DOWN_BLOCK_TYPES = (
     "DownBlock3D",            # level 0: 64×64, pure conv
     "DownBlock3D",            # level 1: 32×32, pure conv
-    "DownBlock3D",            # level 2: 16×16, pure conv
-    "CrossAttnDownBlock3D",   # level 3:  8×8,  768 tokens — cheap global attn
+    "CrossAttnDownBlock3D",   # level 2: 16×16, 3072 tokens — intermediate attn
+    "CrossAttnDownBlock3D",   # level 3:  8×8,   768 tokens — bottleneck attn
 )
 UP_BLOCK_TYPES = (
     "CrossAttnUpBlock3D",     # mirror of level 3
-    "UpBlock3D",              # mirror of level 2
+    "CrossAttnUpBlock3D",     # mirror of level 2
     "UpBlock3D",              # mirror of level 1
     "UpBlock3D",              # mirror of level 0
 )
