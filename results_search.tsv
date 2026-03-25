@@ -1,0 +1,44 @@
+commit	val_loss	memory_gb	status	description
+1d728d0	0.000000	0.0	crash	baseline (256,512,1024,1024) batch=4 OOM
+21ae2cd	1.000050	41.5	keep	baseline (256,512,1024,1024) batch=1 lr=1e-4 LCMScheduler — no learning, val_loss~1.0
+3e3f3df	0.999948	41.5	keep	DDPMScheduler + lr=5e-4 — marginal gain, still no convergence at 1095M params
+2c293a5	1.000164	21.6	discard	(128,256,512,512) attn@2-3 batch=2 lr=1e-3 — flat loss, still null predictor
+599ed86	0.999902	16.5	keep	(64,128,256,256) conv-only batch=4 lr=2e-3 warmup=200 — best so far, 4873 steps
+15d0d6d	0.999888	17.7	keep	(64,128,256,256) CrossAttn@bottleneck only (8x8) — new best
+b40ecec	1.000246	20.8	discard	(64,128,256) 3-level shallower — worse, too few levels
+12d8ad1	0.999957	17.0	discard	(64,128,256,256,256) 5-level deeper — worse than 4-level
+780a5e8	0.999822	13.6	keep	(64,128,256,256) 4-level layers_per_block=1 — new best, 5753 steps
+98061f7	1.000450	21.7	discard	(64,128,256,256) layers_per_block=3 — fewer steps, worse
+1adb90c	0.999749	22.0	keep	(128,256,512,512) lpb=1 — new best, capacity beats step count
+e13ba68	1.000044	47.5	discard	(256,512,1024,1024) lpb=1 — too wide, only 1142 steps
+50d2bb9	0.999917	22.0	discard	cosine LR decay 2e-3→1e-5 — hurts, anneals too early in 15min budget
+1eff9b8	1.000156	22.0	discard	lr=3e-3 — too high, unstable
+61257d9	1.000098	12.1	discard	batch=2 — more steps but noisier gradients
+bea42d4	0.999788	23.5	keep	(128,256,512,512) attn@2+3 — new best, 2590 steps
+2ca7522	0.999974	32.5	discard	(192,384,768,768) — worse, step count hurts
+ea94330	1.000086	20.3	discard	(64,128,256,512) asymmetric — worse
+cfda187	0.999878	23.5	discard	warmup=500 — too long, slows early training
+f77ea30	1.000250	23.5	discard	weight_decay=0 — worse, regularization helps
+5df0d2d	0.000000	0.0	crash	GRAD_CLIP=None
+4f108bf	0.000000	0.0	crash	LR=0.003
+5871b1c	0.000000	0.0	crash	WARMUP_STEPS=200
+3327270	0.000000	0.0	crash	WEIGHT_DECAY=0.1
+eaaf35a	0.000000	0.0	crash	GRAD_CLIP=2.0
+c09e26d	0.000000	0.0	crash	WEIGHT_DECAY=0
+6d2868d	0.000000	0.0	crash	LR=0.0015
+c8c2bdd	0.000000	0.0	crash	LR=0.001
+f878ee0	0.000000	0.0	crash	LAYERS_PER_BLOCK=1
+0197478	0.000000	0.0	crash	GRAD_CLIP=0.5
+2202ff1	0.000000	0.0	crash	ATTENTION_HEAD_DIM=64
+255b92b	0.000000	0.0	crash	WARMUP_STEPS=300
+33876ac	0.000000	0.0	crash	LR=0.0015
+bea42d4	0.000000	0.0	crash	ATTENTION_HEAD_DIM=32
+4fd168d	0.000000	0.0	crash	LAYERS_PER_BLOCK=2
+01483ab	0.000000	0.0	crash	WEIGHT_DECAY=0.001
+981f49a	0.000000	0.0	crash	ATTENTION_HEAD_DIM=64
+1adb90c	0.000000	0.0	crash	WARMUP_STEPS=200
+780a5e8	1.000114	0.0	discard	BLOCK_OUT_CHANNELS=(64, 128, 256, 256)
+15d0d6d	0.999919	0.0	discard	GRAD_CLIP=1.0
+55d1df1	1.000258	0.0	discard	LR=0.002
+bf2d7a5	1.000235	0.0	discard	GRAD_CLIP=0.5
+9d2a044	1.000119	0.0	discard	GRAD_CLIP=2.0
