@@ -42,7 +42,7 @@ CACHE_DIR          = "search_cache"
 COND_CHANNELS      = 20   # X channels
 TARGET_CHANNELS    = 14   # Y channels
 IN_CHANNELS        = TARGET_CHANNELS + COND_CHANNELS  # 34
-TRAIN_TIME_BUDGET  = 900  # wall-clock seconds of pure training (15 min)
+TRAIN_TIME_BUDGET  = 1800  # wall-clock seconds of pure training (15 min)
 
 # ---------------------------------------------------------------------------
 # MODEL CONFIGURATION — agent modifies everything in this section
