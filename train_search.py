@@ -49,7 +49,7 @@ TRAIN_TIME_BUDGET  = 1800  # wall-clock seconds of pure training (15 min)
 # ---------------------------------------------------------------------------
 
 # UNet3D architecture
-BLOCK_OUT_CHANNELS   = (160, 320, 640, 640)     # wider channels with confirmed best lpb=1
+BLOCK_OUT_CHANNELS   = (64, 128, 256, 256)     # wider channels with confirmed best lpb=1
 LAYERS_PER_BLOCK     = 1                         # confirmed best: more steps wins
 NORM_NUM_GROUPS      = 32                        # GroupNorm groups (must divide all channels)
 CROSS_ATTN_DIM       = 1                         # cross-attention dim (keep at 1)
