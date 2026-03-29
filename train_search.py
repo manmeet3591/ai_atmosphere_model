@@ -53,7 +53,7 @@ BLOCK_OUT_CHANNELS   = (96, 192, 384, 384)     # wider channels with confirmed b
 LAYERS_PER_BLOCK     = 1                         # confirmed best: more steps wins
 NORM_NUM_GROUPS      = 32                        # GroupNorm groups (must divide all channels)
 CROSS_ATTN_DIM       = 1                         # cross-attention dim (keep at 1)
-ATTENTION_HEAD_DIM   = 32                        # attention head dim
+Z                        # attention head dim
 
 # CrossAttn at levels 2-3 (16×16=3072 + 8×8=768 tokens = 3840 total).
 # More global receptive field for teleconnections than level 3 only.
