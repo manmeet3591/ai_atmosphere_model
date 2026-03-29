@@ -83,7 +83,7 @@ GRAD_CLIP    = 1.0   # set to None to disable gradient clipping
 BATCH_SIZE = 4
 
 # LR warmup steps (linear ramp from 0 → LR); 0 = no warmup
-WARMUP_STEPS = 200
+H0
 
 # ---------------------------------------------------------------------------
 # Fixed infrastructure — do NOT modify below this line
