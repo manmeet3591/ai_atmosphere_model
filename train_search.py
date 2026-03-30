@@ -42,18 +42,18 @@ CACHE_DIR          = "search_cache"
 COND_CHANNELS      = 20   # X channels
 TARGET_CHANNELS    = 14   # Y channels
 IN_CHANNELS        = TARGET_CHANNELS + COND_CHANNELS  # 34
-TRAIN_TIME_BUDGET  = 1800  # wall-clock seconds of pure training (15 min)
+TRAIN_TIME_BUDGET  = 900  # wall-clock seconds of pure training (15 min)
 
 # ---------------------------------------------------------------------------
 # MODEL CONFIGURATION — agent modifies everything in this section
 # ---------------------------------------------------------------------------
 
 # UNet3D architecture
-BLOCK_OUT_CHANNELS   = (96, 192, 384, 384)     # wider channels with confirmed best lpb=1
+BLOCK_OUT_CHANNELS   = (128, 256, 512, 512)     # wider channels with confirmed best lpb=1
 LAYERS_PER_BLOCK     = 1                         # confirmed best: more steps wins
 NORM_NUM_GROUPS      = 32                        # GroupNorm groups (must divide all channels)
 CROSS_ATTN_DIM       = 1                         # cross-attention dim (keep at 1)
-Z                        # attention head dim
+ATTENTION_HEAD_DIM   = 32                        # attention head dim
 
 # CrossAttn at levels 2-3 (16×16=3072 + 8×8=768 tokens = 3840 total).
 # More global receptive field for teleconnections than level 3 only.
@@ -83,7 +83,7 @@ GRAD_CLIP    = 1.0   # set to None to disable gradient clipping
 BATCH_SIZE = 4
 
 # LR warmup steps (linear ramp from 0 → LR); 0 = no warmup
-H0
+WARMUP_STEPS = 200
 
 # ---------------------------------------------------------------------------
 # Fixed infrastructure — do NOT modify below this line
