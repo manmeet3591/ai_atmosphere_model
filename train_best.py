@@ -872,7 +872,7 @@ def train(args):
                 # x_t = (1 - sigma_t) * x_1 + sigma_t * x_0
                 # where x_1 is data (y) and x_0 is noise
                 sigmas = scheduler.sigmas.to(device)
-                step_indices = [scheduler.index_for_timestep(t) for t in timesteps]
+                step_indices = [scheduler.index_for_timestep(t.item()) for t in timesteps]
                 sigma = sigmas[step_indices].flatten()
                 while len(sigma.shape) < len(y.shape):
                     sigma = sigma.unsqueeze(-1)
@@ -901,7 +901,7 @@ def train(args):
                 log.info(f"  {date_t_str}  epoch {epoch:02d}/{args.epochs_per_day}"
                          f"  loss={loss_val:.6f}  step={step}")
 
-                del noise, noisy_y, net_input, noise_pred, loss
+                del noise, noisy_y, net_input, pred_velocity, loss
 
             mean_loss = np.mean(day_losses)
             if mean_loss < best_loss:
