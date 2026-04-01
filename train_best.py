@@ -32,7 +32,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from scipy.spatial import cKDTree
-from diffusers import UNet3DConditionModel, LCMScheduler
+from diffusers import UNet3DConditionModel, FlowMatchEulerDiscreteScheduler
 import earth2grid
 
 # ---------------------------------------------------------------------------
@@ -761,7 +761,7 @@ def train(args):
 
     # -- Model + training objects --
     model     = build_model(device)
-    scheduler = LCMScheduler(num_train_timesteps=1000)
+    scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
     loss_fn   = nn.MSELoss()
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
 
@@ -867,16 +867,30 @@ def train(args):
                 noise      = torch.randn_like(y)
                 timesteps  = torch.randint(
                     0, scheduler.config.num_train_timesteps, (1,), device=device).long()
-                noisy_y    = scheduler.add_noise(y, noise, timesteps)
+                
+                # For Flow Matching, the noisy_y is a linear interpolation:
+                # x_t = (1 - sigma_t) * x_1 + sigma_t * x_0
+                # where x_1 is data (y) and x_0 is noise
+                sigmas = scheduler.sigmas.to(device)
+                step_indices = [scheduler.index_for_timestep(t) for t in timesteps]
+                sigma = sigmas[step_indices].flatten()
+                while len(sigma.shape) < len(y.shape):
+                    sigma = sigma.unsqueeze(-1)
+                
+                noisy_y = (1.0 - sigma) * y + sigma * noise
+                # Flow matching objective: predict velocity from x_0 (noise) to x_1 (y)
+                target_velocity = y - noise
+
                 net_input  = torch.cat([noisy_y, x], dim=1)
 
-                noise_pred = model(
+                # UNet predicts the velocity
+                pred_velocity = model(
                     sample=net_input,
                     timestep=timesteps,
                     encoder_hidden_states=encoder_hidden,
                 ).sample
 
-                loss = loss_fn(noise_pred, noise)
+                loss = loss_fn(pred_velocity, target_velocity)
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
