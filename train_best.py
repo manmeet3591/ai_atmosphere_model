@@ -866,7 +866,7 @@ def train(args):
             for epoch in range(1, args.epochs_per_day + 1):
                 noise      = torch.randn_like(y)
                 timesteps  = torch.randint(
-                    0, scheduler.config.num_train_timesteps, (1,), device=device).long()
+                    1, scheduler.config.num_train_timesteps + 1, (1,), device=device).long()
                 
                 # For Flow Matching, the noisy_y is a linear interpolation:
                 # x_t = (1 - sigma_t) * x_1 + sigma_t * x_0
