@@ -49,35 +49,34 @@ TRAIN_TIME_BUDGET  = 900  # wall-clock seconds of pure training (15 min)
 # ---------------------------------------------------------------------------
 
 # UNet3D architecture
-BLOCK_OUT_CHANNELS   = (64, 128, 256, 256)     # wider channels with confirmed best lpb=1
-LAYERS_PER_BLOCK     = 1                         # confirmed best: more steps wins
+BLOCK_OUT_CHANNELS   = (128, 256, 512, 512)     # Best found in NAS
+LAYERS_PER_BLOCK     = 1                         # Best found in NAS
 NORM_NUM_GROUPS      = 32                        # GroupNorm groups (must divide all channels)
 CROSS_ATTN_DIM       = 1                         # cross-attention dim (keep at 1)
 ATTENTION_HEAD_DIM   = 32                        # attention head dim
 
-# CrossAttn at levels 2-3 (16×16=3072 + 8×8=768 tokens = 3840 total).
-# More global receptive field for teleconnections than level 3 only.
+# Down/Up block types
 DOWN_BLOCK_TYPES = (
-    "DownBlock3D",            # level 0: 64×64, pure conv
-    "DownBlock3D",            # level 1: 32×32, pure conv
-    "CrossAttnDownBlock3D",   # level 2: 16×16, 3072 tokens — intermediate attn
-    "CrossAttnDownBlock3D",   # level 3:  8×8,   768 tokens — bottleneck attn
+    "DownBlock3D",            
+    "DownBlock3D",            
+    "DownBlock3D",            
+    "CrossAttnDownBlock3D",   
 )
 UP_BLOCK_TYPES = (
-    "CrossAttnUpBlock3D",     # mirror of level 3
-    "CrossAttnUpBlock3D",     # mirror of level 2
-    "UpBlock3D",              # mirror of level 1
-    "UpBlock3D",              # mirror of level 0
+    "CrossAttnUpBlock3D",     
+    "UpBlock3D",              
+    "UpBlock3D",              
+    "UpBlock3D",              
 )
 
-# Diffusion scheduler — try LCMScheduler or DDPMScheduler
+# Diffusion scheduler
 SCHEDULER_CLASS    = DDPMScheduler
 NUM_TRAIN_TIMESTEPS = 1000
 
 # Optimizer
-LR           = 2e-3
+LR           = 1e-4
 WEIGHT_DECAY = 1e-2
-GRAD_CLIP    = 1.0   # set to None to disable gradient clipping
+GRAD_CLIP    = 1.0
 
 # Batch size
 BATCH_SIZE = 4
@@ -128,8 +127,8 @@ def make_batch(samples, batch_size, device):
     """Randomly sample a mini-batch from the cached samples."""
     import random
     chosen = random.choices(samples, k=batch_size)
-    X = torch.cat([s[0] for s in chosen], dim=0)  # [B, 20, 12, 64, 64]
-    Y = torch.cat([s[1] for s in chosen], dim=0)  # [B, 14, 12, 64, 64]
+    X = torch.cat([s[0] for s in chosen], dim=0)
+    Y = torch.cat([s[1] for s in chosen], dim=0)
     return X.to(device), Y.to(device)
 
 
@@ -171,8 +170,6 @@ def train(args):
     scheduler = SCHEDULER_CLASS(num_train_timesteps=NUM_TRAIN_TIMESTEPS)
     loss_fn   = nn.MSELoss()
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-
-    peak_vram_start = torch.cuda.memory_allocated(device) if device == "cuda" else 0
 
     # ---- Training loop with fixed wall-clock budget ----
     model.train()
