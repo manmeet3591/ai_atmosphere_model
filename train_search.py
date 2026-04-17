@@ -49,40 +49,40 @@ TRAIN_TIME_BUDGET  = 900  # wall-clock seconds of pure training (15 min)
 # ---------------------------------------------------------------------------
 
 # UNet3D architecture
-BLOCK_OUT_CHANNELS   = (256, 512, 1024, 1024)   # channel sizes per resolution level
-LAYERS_PER_BLOCK     = 2                         # ResNet layers per UNet block
+BLOCK_OUT_CHANNELS   = (128, 256, 512, 512)     # Best found in NAS
+LAYERS_PER_BLOCK     = 1                         # Best found in NAS
 NORM_NUM_GROUPS      = 32                        # GroupNorm groups (must divide all channels)
-CROSS_ATTN_DIM       = 1                         # cross-attention dim (keep at 1 unless adding conditioning)
-ATTENTION_HEAD_DIM   = 64                        # attention head dim (must divide block channels)
+CROSS_ATTN_DIM       = 1                         # cross-attention dim (keep at 1)
+ATTENTION_HEAD_DIM   = 32                        # attention head dim
 
-# Down/Up block types (must be same length as BLOCK_OUT_CHANNELS)
-# Options: "DownBlock3D", "CrossAttnDownBlock3D"
-#          "UpBlock3D",   "CrossAttnUpBlock3D"
+# Down/Up block types
 DOWN_BLOCK_TYPES = (
-    "DownBlock3D",            # level 0: 64×64 spatial, pure conv (efficient)
-    "CrossAttnDownBlock3D",   # level 1: 32×32, global attention
-    "CrossAttnDownBlock3D",   # level 2: 16×16, global attention
-    "CrossAttnDownBlock3D",   # level 3:  8×8,  global attention
+    "DownBlock3D",            
+    "DownBlock3D",            
+    "DownBlock3D",            
+    "CrossAttnDownBlock3D",   
 )
 UP_BLOCK_TYPES = (
-    "CrossAttnUpBlock3D",     # mirror of level 3
-    "CrossAttnUpBlock3D",     # mirror of level 2
-    "CrossAttnUpBlock3D",     # mirror of level 1
-    "UpBlock3D",              # mirror of level 0
+    "CrossAttnUpBlock3D",     
+    "UpBlock3D",              
+    "UpBlock3D",              
+    "UpBlock3D",              
 )
 
-# Diffusion scheduler — try LCMScheduler or DDPMScheduler
-SCHEDULER_CLASS    = LCMScheduler
+# Diffusion scheduler
+SCHEDULER_CLASS    = DDPMScheduler
 NUM_TRAIN_TIMESTEPS = 1000
 
 # Optimizer
 LR           = 1e-4
 WEIGHT_DECAY = 1e-2
-GRAD_CLIP    = 1.0   # set to None to disable gradient clipping
+GRAD_CLIP    = 1.0
 
-# Batch size (number of days per GPU step)
-# With 98 GB VRAM: batch 4 works for the baseline (256,512,1024,1024) arch
+# Batch size
 BATCH_SIZE = 4
+
+# LR warmup steps (linear ramp from 0 → LR); 0 = no warmup
+WARMUP_STEPS = 200
 
 # ---------------------------------------------------------------------------
 # Fixed infrastructure — do NOT modify below this line
@@ -127,8 +127,8 @@ def make_batch(samples, batch_size, device):
     """Randomly sample a mini-batch from the cached samples."""
     import random
     chosen = random.choices(samples, k=batch_size)
-    X = torch.cat([s[0] for s in chosen], dim=0)  # [B, 20, 12, 64, 64]
-    Y = torch.cat([s[1] for s in chosen], dim=0)  # [B, 14, 12, 64, 64]
+    X = torch.cat([s[0] for s in chosen], dim=0)
+    Y = torch.cat([s[1] for s in chosen], dim=0)
     return X.to(device), Y.to(device)
 
 
@@ -171,8 +171,6 @@ def train(args):
     loss_fn   = nn.MSELoss()
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
-    peak_vram_start = torch.cuda.memory_allocated(device) if device == "cuda" else 0
-
     # ---- Training loop with fixed wall-clock budget ----
     model.train()
     step = 0
@@ -204,6 +202,12 @@ def train(args):
         if GRAD_CLIP is not None:
             nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         optimizer.step()
+
+        # Linear LR warmup
+        if WARMUP_STEPS > 0 and step < WARMUP_STEPS:
+            lr_scale = (step + 1) / WARMUP_STEPS
+            for pg in optimizer.param_groups:
+                pg['lr'] = LR * lr_scale
 
         step += 1
         if step % 50 == 0:
