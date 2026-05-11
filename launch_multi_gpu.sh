@@ -13,10 +13,9 @@ BIND="/media/airlab/ROCSTOR:/media/airlab/ROCSTOR"
 NUM_GPUS=2
 
 # --- GPU Power Management ---
-# Cap each GPU to 200W (67% of 300W max) to prevent system shutdown.
-# Two GPUs at 200W = 400W total, well within typical workstation PSU headroom.
-# Adjust up (max 300) if thermals/PSU allow, or down if still unstable.
-GPU_POWER_LIMIT_W=200
+# Cap each GPU to 250W (min valid for Blackwell Max-Q, max 300W).
+# Two GPUs at 250W = 500W total. Adjust up if thermals/PSU allow.
+GPU_POWER_LIMIT_W=250
 
 echo "=== GPU Power Management ==="
 echo "Setting power limit to ${GPU_POWER_LIMIT_W}W per GPU..."
@@ -50,8 +49,9 @@ echo ""
 
 # --- Launch with torchrun inside Apptainer ---
 apptainer exec --nv --env PYTHONNOUSERSITE=1 \
-    --env NCCL_DEBUG=INFO \
-    --env NCCL_P2P_DISABLE=0 \
+    --env NCCL_DEBUG=WARN \
+    --env NCCL_P2P_DISABLE=1 \
+    --env NCCL_SHM_DISABLE=0 \
     --bind "$BIND" \
     "$SIF" \
     torchrun \
