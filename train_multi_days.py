@@ -134,24 +134,27 @@ def train(args):
     scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
     loss_fn   = nn.MSELoss()
 
-    # -- Resume --
+    # -- Resume (rank 0 loads, then broadcasts weights to all ranks) --
     completed_dates, best_loss = load_progress(args.progress_file)
     if args.resume and args.checkpoint and os.path.exists(args.checkpoint):
         if is_main():
             log.info(f"Resuming from checkpoint: {args.checkpoint}")
-        try:
-            ckpt = torch.load(args.checkpoint, map_location=device)
-            if isinstance(ckpt, dict) and "model" in ckpt:
-                model.load_state_dict(ckpt["model"])
-                if "best_loss" in ckpt:
-                    best_loss = ckpt["best_loss"]
-            else:
-                model.load_state_dict(ckpt)
-        except RuntimeError as e:
-            if is_main():
+            try:
+                ckpt = torch.load(args.checkpoint, map_location=device)
+                if isinstance(ckpt, dict) and "model" in ckpt:
+                    model.load_state_dict(ckpt["model"])
+                    if "best_loss" in ckpt:
+                        best_loss = ckpt["best_loss"]
+                else:
+                    model.load_state_dict(ckpt)
+            except RuntimeError as e:
                 log.warning(f"  Checkpoint incompatible — starting from scratch. {e}")
 
     if world_size > 1:
+        # Broadcast model weights from rank 0 so all ranks are identical
+        for param in model.parameters():
+            dist.broadcast(param.data, src=0)
+        dist.barrier()
         model = DDP(model, device_ids=[int(os.environ.get("LOCAL_RANK", 0))])
         if is_main():
             log.info(f"  Model wrapped in DDP ({world_size} GPUs)")
@@ -160,7 +163,7 @@ def train(args):
     optimizer = optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-2)
     scaler = torch.cuda.amp.GradScaler() if "cuda" in device else None
 
-    if args.resume and args.checkpoint and os.path.exists(args.checkpoint):
+    if args.resume and args.checkpoint and os.path.exists(args.checkpoint) and is_main():
         try:
             ckpt = torch.load(args.checkpoint, map_location=device)
             if isinstance(ckpt, dict) and "optimizer" in ckpt:

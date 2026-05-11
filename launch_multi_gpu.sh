@@ -50,6 +50,8 @@ echo ""
 
 # --- Launch with torchrun inside Apptainer ---
 apptainer exec --nv --env PYTHONNOUSERSITE=1 \
+    --env NCCL_DEBUG=INFO \
+    --env NCCL_P2P_DISABLE=0 \
     --bind "$BIND" \
     "$SIF" \
     torchrun \
