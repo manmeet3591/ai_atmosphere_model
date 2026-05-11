@@ -56,7 +56,8 @@ def setup_ddp():
     if "RANK" not in os.environ:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         return 0, 1, device
-    dist.init_process_group("nccl")
+    dist.init_process_group("nccl",
+                            timeout=datetime.timedelta(minutes=30))
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
