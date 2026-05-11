@@ -28,13 +28,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from diffusers import LCMScheduler
+from diffusers import FlowMatchEulerDiscreteScheduler
 
 # ---------------------------------------------------------------------------
 # Reuse every helper from train.py — no duplication
 # ---------------------------------------------------------------------------
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from train import (
     open_era5,
     build_godas_index,
@@ -50,6 +52,9 @@ from train import (
     _read_godas_grib_eccodes,
     ensure_lat_ascending,
     standardize_latlon,
+    setup_ddp,
+    cleanup_ddp,
+    is_main,
     COND_CHANNELS,
     TARGET_CHANNELS,
     CROSS_ATTN_DIM,
@@ -106,34 +111,68 @@ def load_godas_cached(godas_index, date_str):
 # ---------------------------------------------------------------------------
 
 def train(args):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    log.info(f"Device: {device}  batch_days={args.batch_days}  "
-             f"epochs_per_batch={args.epochs_per_batch}")
+    rank, world_size, device = setup_ddp()
+    if is_main():
+        log.info(f"Device: {device}  world_size={world_size}  "
+                 f"batch_days={args.batch_days}  "
+                 f"epochs_per_batch={args.epochs_per_batch}")
 
     ds_atmos, ds_land = open_era5()
 
-    log.info(f"Indexing GODAS from {args.godas_dir} ...")
+    if is_main():
+        log.info(f"Indexing GODAS from {args.godas_dir} ...")
     godas_index = build_godas_index(args.godas_dir)
 
-    log.info(f"Loading static fields from {args.static_dir} ...")
+    if is_main():
+        log.info(f"Loading static fields from {args.static_dir} ...")
     ds_mask_raw, ds_topo_raw = load_static_fields(args.static_dir)
 
     regridder, ref_lat, ref_lon = build_regridder(ds_atmos)
     ds_stat = prepare_static_fields(ds_mask_raw, ds_topo_raw, ref_lat, ref_lon)
 
     model     = build_model(device)
-    scheduler = LCMScheduler(num_train_timesteps=1000)
+    scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
     loss_fn   = nn.MSELoss()
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
 
     # -- Resume --
     completed_dates, best_loss = load_progress(args.progress_file)
-    if args.checkpoint and os.path.exists(args.checkpoint):
-        log.info(f"Loading weights from checkpoint: {args.checkpoint}")
+    if args.resume and args.checkpoint and os.path.exists(args.checkpoint):
+        if is_main():
+            log.info(f"Resuming from checkpoint: {args.checkpoint}")
         try:
-            model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+            ckpt = torch.load(args.checkpoint, map_location=device)
+            if isinstance(ckpt, dict) and "model" in ckpt:
+                model.load_state_dict(ckpt["model"])
+                if "best_loss" in ckpt:
+                    best_loss = ckpt["best_loss"]
+            else:
+                model.load_state_dict(ckpt)
         except RuntimeError as e:
-            log.warning(f"  Checkpoint incompatible — starting from scratch. {e}")
+            if is_main():
+                log.warning(f"  Checkpoint incompatible — starting from scratch. {e}")
+
+    # Wrap model in DDP if multi-GPU
+    if world_size > 1:
+        model = DDP(model, device_ids=[int(os.environ.get("LOCAL_RANK", 0))])
+        if is_main():
+            log.info(f"  Model wrapped in DDP ({world_size} GPUs)")
+
+    raw_model = model.module if world_size > 1 else model
+    optimizer = optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-2)
+    scaler = torch.cuda.amp.GradScaler() if "cuda" in device else None
+
+    # Load optimizer state after DDP wrapping
+    if args.resume and args.checkpoint and os.path.exists(args.checkpoint):
+        try:
+            ckpt = torch.load(args.checkpoint, map_location=device)
+            if isinstance(ckpt, dict) and "optimizer" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer"])
+        except Exception:
+            pass
+
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
 
     # -- Date list --
     start = datetime.date.fromisoformat(args.start_date)
@@ -146,18 +185,21 @@ def train(args):
 
     dates_todo = [d for d in all_dates if d.isoformat() not in completed_dates]
     skipped = len(all_dates) - len(dates_todo)
-    log.info(f"Training: {start} -> {end}  ({len(all_dates)} days total, "
-             f"{skipped} already done, {len(dates_todo)} remaining, "
-             f"batch={args.batch_days}, epochs/batch={args.epochs_per_batch})")
+    if is_main():
+        log.info(f"Training: {start} -> {end}  ({len(all_dates)} days total, "
+                 f"{skipped} already done, {len(dates_todo)} remaining, "
+                 f"batch={args.batch_days}, epochs/batch={args.epochs_per_batch})")
 
     if not dates_todo:
-        log.info("All dates already completed. Nothing to do.")
+        if is_main():
+            log.info("All dates already completed. Nothing to do.")
+        cleanup_ddp()
         return
 
-    # -- Group into batches of B --
     B = args.batch_days
     batches = [dates_todo[i:i+B] for i in range(0, len(dates_todo), B)]
-    log.info(f"  {len(batches)} batches of up to {B} days each")
+    if is_main():
+        log.info(f"  {len(batches)} batches of up to {B} days each")
 
     model.train()
     step = 0
@@ -165,130 +207,185 @@ def train(args):
     def _submit_batch(pool, date_batch):
         return pool.submit(fetch_era5_date_range, ds_atmos, ds_land, date_batch)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        # Prefetch first batch immediately
-        era5_future = _submit_batch(pool, batches[0])
-        log.info(f"  ERA5 prefetch started: batch 1/{len(batches)}  "
-                 f"({batches[0][0]} .. {batches[0][-1]})")
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            era5_future = _submit_batch(pool, batches[0])
+            if is_main():
+                log.info(f"  ERA5 prefetch started: batch 1/{len(batches)}  "
+                         f"({batches[0][0]} .. {batches[0][-1]})")
 
-        for bi, date_batch in enumerate(batches):
-            # ---- Wait for this batch's ERA5 ----
-            t_wait = time.perf_counter()
-            try:
-                era5_map = era5_future.result()  # dict: date_str -> (atm_t, atm_t1, lnd_t)
-            except Exception as exc:
-                log.warning(f"  SKIP batch {bi+1}: ERA5 fetch failed: {exc}")
+            for bi, date_batch in enumerate(batches):
+                t_wait = time.perf_counter()
+                try:
+                    era5_map = era5_future.result()
+                except Exception as exc:
+                    if is_main():
+                        log.warning(f"  SKIP batch {bi+1}: ERA5 fetch failed: {exc}")
+                    if bi + 1 < len(batches):
+                        era5_future = _submit_batch(pool, batches[bi + 1])
+                    continue
+                wait_s = time.perf_counter() - t_wait
+                if is_main():
+                    log.info(f"  Batch {bi+1}/{len(batches)} ERA5 ready  wait={wait_s:.1f}s  "
+                             f"({len(era5_map)} days fetched)")
+
                 if bi + 1 < len(batches):
                     era5_future = _submit_batch(pool, batches[bi + 1])
-                continue
-            wait_s = time.perf_counter() - t_wait
-            log.info(f"  Batch {bi+1}/{len(batches)} ERA5 ready  wait={wait_s:.1f}s  "
-                     f"({len(era5_map)} days fetched)")
 
-            # ---- Prefetch next batch in background ----
-            if bi + 1 < len(batches):
-                era5_future = _submit_batch(pool, batches[bi + 1])
-                log.info(f"  ERA5 prefetch started: batch {bi+2}/{len(batches)}  "
-                         f"({batches[bi+1][0]} .. {batches[bi+1][-1]})")
+                batch_X, batch_Y, dates_in_batch = [], [], []
 
-            # ---- Build samples (GODAS from cache + channels + HEALPix) ----
-            batch_X, batch_Y, dates_in_batch = [], [], []
+                for date_t in date_batch:
+                    date_t_str  = date_t.isoformat()
+                    date_t1_str = (date_t + datetime.timedelta(days=1)).isoformat()
 
-            for date_t in date_batch:
-                date_t_str  = date_t.isoformat()
-                date_t1_str = (date_t + datetime.timedelta(days=1)).isoformat()
+                    if date_t_str not in era5_map:
+                        continue
+                    ds_atm_t, ds_atm_t1, ds_lnd_t = era5_map[date_t_str]
 
-                if date_t_str not in era5_map:
-                    log.warning(f"  SKIP {date_t_str}: not in ERA5 batch result")
+                    try:
+                        ds_ocn_t = load_godas_cached(godas_index, date_t_str)
+                        xb, yb = build_sample(
+                            date_t_str, date_t1_str,
+                            ds_atm_t, ds_atm_t1, ds_lnd_t,
+                            godas_index, ds_stat, ref_lat, ref_lon, regridder,
+                            ds_ocn=ds_ocn_t,
+                        )
+                    except Exception as exc:
+                        if is_main():
+                            log.warning(f"  SKIP {date_t_str}: sample build failed: {exc}")
+                        continue
+
+                    batch_X.append(xb)
+                    batch_Y.append(yb)
+                    dates_in_batch.append(date_t_str)
+
+                del era5_map
+                gc.collect()
+
+                if not batch_X:
                     continue
-                ds_atm_t, ds_atm_t1, ds_lnd_t = era5_map[date_t_str]
 
-                try:
-                    ds_ocn_t = load_godas_cached(godas_index, date_t_str)
-                    xb, yb = build_sample(
-                        date_t_str, date_t1_str,
-                        ds_atm_t, ds_atm_t1, ds_lnd_t,
-                        godas_index, ds_stat, ref_lat, ref_lon, regridder,
-                        ds_ocn=ds_ocn_t,
-                    )
-                except Exception as exc:
-                    log.warning(f"  SKIP {date_t_str}: sample build failed: {exc}")
+                N = len(batch_X)
+                X_full = torch.cat(batch_X, dim=0)   # [N, 20, 12, 64, 64]
+                Y_full = torch.cat(batch_Y, dim=0)   # [N, 14, 12, 64, 64]
+                del batch_X, batch_Y
+
+                # Split batch across GPUs for DDP
+                if world_size > 1:
+                    chunk = N // world_size
+                    start_idx = rank * chunk
+                    end_idx = start_idx + chunk if rank < world_size - 1 else N
+                    X = X_full[start_idx:end_idx].to(device)
+                    Y = Y_full[start_idx:end_idx].to(device)
+                    n_local = X.shape[0]
+                    del X_full, Y_full
+                else:
+                    X = X_full.to(device)
+                    Y = Y_full.to(device)
+                    n_local = N
+                    del X_full, Y_full
+
+                enc_hid = torch.zeros(n_local, 1, CROSS_ATTN_DIM, device=device)
+                if is_main():
+                    log.info(f"  === GPU batch {bi+1}: {N} days total, "
+                             f"{n_local} on this rank  "
+                             f"{dates_in_batch[0]} .. {dates_in_batch[-1]}  "
+                             f"X{list(X.shape)} ===")
+
+                if torch.isnan(X).any() or torch.isnan(Y).any():
+                    if is_main():
+                        log.warning(f"  SKIP batch {bi+1}: NaN in input/target")
                     continue
 
-                batch_X.append(xb)
-                batch_Y.append(yb)
-                dates_in_batch.append(date_t_str)
+                batch_losses = []
+                for epoch in range(1, args.epochs_per_batch + 1):
+                    noise = torch.randn_like(Y)
+                    scheduler.set_timesteps(scheduler.config.num_train_timesteps, device=device)
+                    idx = torch.randint(0, len(scheduler.timesteps), (1,), device=device).item()
+                    t = scheduler.timesteps[idx : idx+1]
 
-            del era5_map
-            gc.collect()
+                    sigmas = scheduler.sigmas.to(device)
+                    sigma_idx = scheduler.index_for_timestep(t[0].item())
+                    sigma = sigmas[sigma_idx]
+                    while len(sigma.shape) < len(Y.shape):
+                        sigma = sigma.unsqueeze(-1)
+                    sigma = sigma.expand(n_local, -1, -1, -1, -1)
 
-            if not batch_X:
-                continue
+                    noisy_Y = (1.0 - sigma) * Y + sigma * noise
+                    target_v = Y - noise
+                    net_input = torch.cat([noisy_Y, X], dim=1)
 
-            # ---- Stack into GPU batch ----
-            N = len(batch_X)
-            X = torch.cat(batch_X, dim=0).to(device)   # [N, 20, 12, 64, 64]
-            Y = torch.cat(batch_Y, dim=0).to(device)   # [N, 14, 12, 64, 64]
-            del batch_X, batch_Y
+                    optimizer.zero_grad(set_to_none=True)
+                    with torch.amp.autocast("cuda"):
+                        pred_v = model(
+                            sample=net_input,
+                            timestep=t.expand(n_local),
+                            encoder_hidden_states=enc_hid,
+                        ).sample
+                        loss = loss_fn(pred_v, target_v)
 
-            enc_hid = torch.zeros(N, 1, CROSS_ATTN_DIM, device=device)
-            log.info(f"  === GPU batch {bi+1}: {N} days  "
-                     f"{dates_in_batch[0]} .. {dates_in_batch[-1]}  "
-                     f"X{list(X.shape)} ===")
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        if is_main():
+                            log.warning(f"  NaN/Inf loss in batch {bi+1} epoch {epoch}")
+                        continue
 
-            # ---- Training epochs ----
-            batch_losses = []
-            for epoch in range(1, args.epochs_per_batch + 1):
-                noise      = torch.randn_like(Y)
-                timesteps  = torch.randint(
-                    0, scheduler.config.num_train_timesteps,
-                    (N,), device=device).long()
-                noisy_Y    = scheduler.add_noise(Y, noise, timesteps)
-                net_input  = torch.cat([noisy_Y, X], dim=1)
+                    if scaler:
+                        scaler.scale(loss).backward()
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        optimizer.step()
 
-                noise_pred = model(
-                    sample=net_input,
-                    timestep=timesteps,
-                    encoder_hidden_states=enc_hid,
-                ).sample
+                    loss_val = loss.item()
+                    batch_losses.append(loss_val)
+                    step += 1
+                    if is_main():
+                        log.info(f"  batch {bi+1}  epoch {epoch:02d}/{args.epochs_per_batch}  "
+                                 f"loss={loss_val:.6f}  step={step}")
 
-                loss = loss_fn(noise_pred, noise)
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
+                    del noise, noisy_Y, net_input, pred_v, loss, target_v
 
-                loss_val = loss.item()
-                batch_losses.append(loss_val)
-                step += 1
-                log.info(f"  batch {bi+1}  epoch {epoch:02d}/{args.epochs_per_batch}  "
-                         f"loss={loss_val:.6f}  step={step}")
+                if batch_losses and is_main():
+                    mean_loss = np.mean(batch_losses)
+                    if mean_loss < best_loss:
+                        best_loss = mean_loss
+                        ckpt_data = {"model": raw_model.state_dict(),
+                                     "optimizer": optimizer.state_dict(),
+                                     "best_loss": mean_loss,
+                                     "date": dates_in_batch[0]}
+                        # Save with dynamic name: <base>_<date>_<loss>.pth
+                        base = os.path.splitext(args.checkpoint)[0]
+                        dated_path = f"{base}_{dates_in_batch[0]}_{mean_loss:.6f}.pth"
+                        torch.save(ckpt_data, dated_path)
+                        # Also save as the standard name for easy resume
+                        torch.save(ckpt_data, args.checkpoint)
+                        log.info(f"  Checkpoint saved: {os.path.basename(dated_path)}  "
+                                 f"(best_loss={best_loss:.6f})")
+                    if args.hf_repo:
+                        push_checkpoint_to_hub(
+                            args.checkpoint, args.hf_repo,
+                            best_loss, dates_in_batch[0])
 
-                del noise, noisy_Y, net_input, noise_pred, loss
+                if is_main():
+                    for d_str in dates_in_batch:
+                        completed_dates.add(d_str)
+                    save_progress(args.progress_file, completed_dates, best_loss)
+                    log.info(f"  Progress: {len(completed_dates)}/{len(all_dates)} days done")
 
-            # ---- Checkpoint + HF push ----
-            mean_loss = np.mean(batch_losses)
-            if mean_loss < best_loss:
-                best_loss = mean_loss
-                torch.save(model.state_dict(), args.checkpoint)
-                log.info(f"  Checkpoint saved  (best_loss={best_loss:.6f})")
-                if args.hf_repo:
-                    push_checkpoint_to_hub(
-                        args.checkpoint, args.hf_repo,
-                        best_loss, dates_in_batch[0])
+                del X, Y, enc_hid
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+    finally:
+        cleanup_ddp()
 
-            # ---- Mark all days in batch as done ----
-            for d_str in dates_in_batch:
-                completed_dates.add(d_str)
-            save_progress(args.progress_file, completed_dates, best_loss)
-            log.info(f"  Progress: {len(completed_dates)}/{len(all_dates)} days done")
-
-            del X, Y, enc_hid
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
-
-    log.info(f"Training complete. Best loss: {best_loss:.6f}")
-    log.info(f"Model saved to: {args.checkpoint}")
+    if is_main():
+        log.info(f"Training complete. Best loss: {best_loss:.6f}")
+        log.info(f"Model saved to: {args.checkpoint}")
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +408,9 @@ def parse_args():
                    help="Days per GPU batch (default: 48)")
     p.add_argument("--epochs-per-batch",  type=int, default=8,
                    help="Training epochs per batch (default: 8)")
+    p.add_argument("--resume",            action="store_true", default=False,
+                   help="Resume training from checkpoint if it exists. "
+                        "Default: always start fresh.")
     return p.parse_args()
 
 
