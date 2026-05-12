@@ -138,8 +138,9 @@ def train(args):
     loss_fn   = nn.MSELoss()
 
     # -- Resume (all ranks load from shared filesystem) --
+    resume = not args.no_resume
     completed_dates, best_loss = load_progress(args.progress_file)
-    if args.resume and args.checkpoint and os.path.exists(args.checkpoint):
+    if resume and args.checkpoint and os.path.exists(args.checkpoint):
         if is_main():
             log.info(f"Resuming from checkpoint: {args.checkpoint}")
         try:
@@ -153,6 +154,11 @@ def train(args):
         except RuntimeError as e:
             if is_main():
                 log.warning(f"  Checkpoint incompatible — starting from scratch. {e}")
+    elif not resume:
+        best_loss = float("inf")
+        completed_dates = set()
+        if is_main():
+            log.info("Starting fresh (--no-resume)")
 
     if world_size > 1:
         model = DDP(model, device_ids=[int(os.environ.get("LOCAL_RANK", 0))])
@@ -161,9 +167,9 @@ def train(args):
 
     raw_model = model.module if world_size > 1 else model
     optimizer = optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-2)
-    scaler = torch.cuda.amp.GradScaler() if "cuda" in device else None
+    scaler = torch.amp.GradScaler("cuda") if "cuda" in device else None
 
-    if args.resume and args.checkpoint and os.path.exists(args.checkpoint):
+    if resume and args.checkpoint and os.path.exists(args.checkpoint):
         try:
             ckpt = torch.load(args.checkpoint, map_location=device)
             if isinstance(ckpt, dict) and "optimizer" in ckpt:
@@ -371,12 +377,13 @@ def train(args):
                 mean_loss = np.mean(batch_losses)
                 if mean_loss < best_loss:
                     best_loss = mean_loss
+                    init_cond = f"{dates_in_batch[0]}_to_{dates_in_batch[-1]}"
                     ckpt_data = {"model": raw_model.state_dict(),
                                  "optimizer": optimizer.state_dict(),
                                  "best_loss": mean_loss,
-                                 "date": dates_in_batch[0]}
+                                 "date": init_cond}
                     base = os.path.splitext(args.checkpoint)[0]
-                    dated_path = f"{base}_{dates_in_batch[0]}_{mean_loss:.6f}.pth"
+                    dated_path = f"{base}_{init_cond}_{mean_loss:.6f}.pth"
                     torch.save(ckpt_data, dated_path)
                     torch.save(ckpt_data, args.checkpoint)
                     log.info(f"  Checkpoint saved: {os.path.basename(dated_path)}  "
@@ -424,11 +431,11 @@ def parse_args():
                    help="HuggingFace repo ID (e.g. dsocairlab/Earthmind-S2S)")
     p.add_argument("--batch-days",        type=int, default=48,
                    help="Days per GPU batch (default: 48)")
-    p.add_argument("--epochs-per-batch",  type=int, default=8,
-                   help="Training epochs per batch (default: 8)")
-    p.add_argument("--resume",            action="store_true", default=False,
-                   help="Resume training from checkpoint if it exists. "
-                        "Default: always start fresh.")
+    p.add_argument("--epochs-per-batch",  type=int, default=50,
+                   help="Training epochs per batch (default: 50). "
+                        "Higher = better GPU utilization.")
+    p.add_argument("--no-resume",         action="store_true", default=False,
+                   help="Start training from scratch (default: resume)")
     return p.parse_args()
 
 
