@@ -144,7 +144,7 @@ def train(args):
         if is_main():
             log.info(f"Resuming from checkpoint: {args.checkpoint}")
         try:
-            ckpt = torch.load(args.checkpoint, map_location=device)
+            ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
             if isinstance(ckpt, dict) and "model" in ckpt:
                 model.load_state_dict(ckpt["model"])
                 if "best_loss" in ckpt:
@@ -171,7 +171,7 @@ def train(args):
 
     if resume and args.checkpoint and os.path.exists(args.checkpoint):
         try:
-            ckpt = torch.load(args.checkpoint, map_location=device)
+            ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
             if isinstance(ckpt, dict) and "optimizer" in ckpt:
                 optimizer.load_state_dict(ckpt["optimizer"])
         except Exception:
