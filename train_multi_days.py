@@ -277,19 +277,22 @@ def train(args):
             if N == 0:
                 continue
 
-            # ---- Broadcast tensors from rank 0 to all ranks ----
+            # ---- Broadcast tensors from rank 0 to all ranks (NCCL needs CUDA) ----
             if world_size > 1:
-                if not is_main():
-                    X_full = torch.empty(N, 20, 12, 64, 64)
-                    Y_full = torch.empty(N, 14, 12, 64, 64)
+                if is_main():
+                    X_full = X_full.to(device)
+                    Y_full = Y_full.to(device)
+                else:
+                    X_full = torch.empty(N, 20, 12, 64, 64, device=device)
+                    Y_full = torch.empty(N, 14, 12, 64, 64, device=device)
                 dist.broadcast(X_full, src=0)
                 dist.broadcast(Y_full, src=0)
 
                 chunk = N // world_size
                 s = rank * chunk
                 e = s + chunk if rank < world_size - 1 else N
-                X = X_full[s:e].to(device)
-                Y = Y_full[s:e].to(device)
+                X = X_full[s:e]
+                Y = Y_full[s:e]
                 n_local = X.shape[0]
                 del X_full, Y_full
             else:
